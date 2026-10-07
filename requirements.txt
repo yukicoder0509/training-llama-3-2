@@ -1,0 +1,12 @@
+torch>=2.5
+transformers>=4.46
+accelerate>=1.0
+datasets>=3.0
+adam-mini>=1.1.1
+wandb
+numpy
+liger-kernel>=0.8  # --fused_ce
+flash-attn-4  # --attn_implementation flash_attention_4
+kernels  # Hub attention kernels (flash_attention_2 / flash_attention_3)
+datatrove[io,processing]>=0.10  # dedup_filter.py (MinHash near-dedup, Gopher filters)
+spacy  # datatrove English word tokenizer
