@@ -1,15 +1,14 @@
-"""Muon for the transformer blocks' 2D weight matrices + AdamW for everything else, as one optimizer.
+"""Muon for the decoder layers' 2D weight matrices + AdamW for everything else, as one optimizer.
 
 Split as in modded-nanogpt: Muon (torch.optim.Muon: Nesterov momentum, 5 Newton-Schulz steps in bf16) for
-h.*.attn.c_attn, h.*.attn.c_proj, h.*.mlp.c_fc, h.*.mlp.c_proj; AdamW for wte (tied to lm_head), wpe, biases and
-LayerNorms, with no weight decay on the 1D params (as HF Trainer's AdamW).
+model.layers.*.self_attn.{q,k,v,o}_proj and model.layers.*.mlp.{gate,up,down}_proj; AdamW for embed_tokens (tied to
+lm_head) and the RMSNorm weights, with no weight decay on the 1D params (as HF Trainer's AdamW).
 
 HF Trainer takes one optimizer and builds one LR scheduler on it, so MuonWithAdamW exposes both optimizers'
 param groups (the same dicts) and steps both: the WSD schedule scales the Muon and AdamW LRs by the same factor.
 
-Muon uses adjust_lr_fn="match_rms_adamw" (update scaled by 0.2 * sqrt(max(rows, cols))): HF GPT-2's Conv1D stores
-weights as (in, out), the transpose of nn.Linear, and this scaling is symmetric in the two dims, unlike the default
-"original" sqrt(max(1, rows / cols)). It also puts the Muon LR on roughly the AdamW scale (Moonlight).
+Muon uses adjust_lr_fn="match_rms_adamw" (update scaled by 0.2 * sqrt(max(rows, cols))), which puts the Muon LR on
+roughly the AdamW scale (Moonlight), so one LR range covers both.
 """
 
 import torch
@@ -47,8 +46,8 @@ class MuonWithAdamW(torch.optim.Optimizer):
 def build_muon_adamw(model, muon_lr, muon_momentum, adamw_lr, beta2, weight_decay):
     """Returns (optimizer, names of the Muon params, names of the AdamW params)."""
     muon_params, decay, no_decay, muon_names, adamw_names = [], [], [], [], []
-    for name, p in model.named_parameters():  # tied lm_head.weight is listed once, as transformer.wte.weight
-        if p.ndim == 2 and name.startswith("transformer.h."):
+    for name, p in model.named_parameters():  # tied lm_head.weight is listed once, as model.embed_tokens.weight
+        if p.ndim == 2 and name.startswith("model.layers."):
             muon_params.append(p)
             muon_names.append(name)
         else:

@@ -1,10 +1,12 @@
-# Quick Start
-1. Install virtual environments
-2. Activate virtual environments
-3. Login to Hugging Face and WandB
-4. Create `.env` file. Put `MODEL_NAME=` variable. This is the Hub repo `push_model.py` pushes to.
+# Llama 3.2 1B on Dolma 3 (Lab 5)
 
-# Usage
+Train the Llama 3.2 1B architecture from scratch on `allenai/dolma3_mix-150B-1025` with a fixed token budget
+(default 6B tokens, 8192-token context). Goal and rules: [`DESCRIPTION.md`](DESCRIPTION.md). Results: [`experiments.md`](experiments.md).
+
+# Quick Start
+1. `source .venv/bin/activate`
+2. Log in to Hugging Face and W&B
+3. Create `.env` with `MODEL_NAME=` (the Hub repo `push_model.py` pushes to)
 
 Run heavy work (data prep, training) through Slurm, not on the login node.
 
@@ -14,71 +16,58 @@ Run heavy work (data prep, training) through Slurm, not on the login node.
 sbatch prepare.sbatch
 ```
 
-Writes `train.bin` / `val.bin` to `$OUT_DIR` (default `/work/$USER/c4_gpt2`): the first 20 raw C4 `en`
-train shards (~3B tokens, `--num_train_shards`) and 5k validation docs. This is what `run.sbatch` trains on by default.
+Downloads the dataset (~110 GB, pinned revision) and writes to `$OUT_DIR` (default `/work/$USER/dolma3_llama`):
 
-Cleaned variants (CPU-only datatrove pipelines in `dedup_filter.py`, then tokenized; `val.bin` is copied from the
-raw data so every run evaluates on the same tokens):
+- The OJ split, reproduced exactly: `load_dataset(...)["train"].shuffle(seed=42)`, last 50,000 docs held out. Computed from
+  per-file doc counts (`doc_counts.json`) instead of building the ~400 GB arrow dataset.
+- `train.bin`: the first 5% of the shuffled train docs (`--train_frac`), about 7.5B tokens. This is a uniform sample of
+  the mix, and there is enough to cover 6B tokens without repeating any.
+- `val.bin`: the first 10,000 held-out docs (20%, `--num_val_docs`), used for in-training eval.
+- `eval_docs.jsonl`: all 50k held-out texts, for exact OJ-style evaluation later. Also `meta.json` with the counts.
 
-```
-sbatch dedup_filter.sbatch dedup    # MinHash near-dedup (Jaccard ~0.8)          -> ~/c4_gpt2_dedup
-sbatch dedup_filter.sbatch filter   # + mild Gopher repetition / quality filters  -> ~/c4_gpt2_dedup_filtered
-sbatch run.sbatch --data_dir=$HOME/c4_gpt2_dedup --run_name=...
-```
+Tokens are uint32 (Llama 3 vocab 128,256), one doc = `<|begin_of_text|> text <|end_of_text|>`, packed into 8192 blocks.
+The tokenizer is `unsloth/Llama-3.2-1B` (an ungated copy of Meta's; we have no access to `meta-llama/*`). The data is not cleaned.
+(`dedup_filter.py` / `dedup_filter.sbatch` are the old C4 pipelines, not yet ported.)
 
 ## 2. Train
 
 ```
-sbatch --job-name=gpt2-c4 run.sbatch --run_name=my-run   # defaults = current best setting
+sbatch run.sbatch --run_name=my-run                     # 8 H200 x 8 h max (= the 64 H200-hour cap), 6B tokens
+sbatch --gpus-per-node=2 --cpus-per-task=24 run.sbatch --run_name=baseline --token_budget=3e9   # ~16 H200-hours
+sbatch profile.sbatch --per_device_batch=8              # 20-step speed / memory test, no W&B
 ```
+
+Measured (job 511900, 2 H200, AdamW, compile + fused CE, 4 x 8192 tokens/GPU): **~52.6k tokens/s/GPU, MFU 56%,
+79 GiB peak**. That makes 6B tokens on 8 GPUs about 4 h (~32 H200-hours). Muon is ~4% slower, Adam-mini about the same.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--learning_rate` | `1.25e-3` | Peak LR |
-| `--global_batch_size` | `128` | Sequences per optimizer step (per-GPU batch × grad accum × 2 GPUs); must have a measured step time in `SEC_PER_STEP` (64, 128, 256, 512) or pass `--sec_per_step` |
-| `--per_device_batch` | `64` | Max sequences per GPU per micro-batch; grad accum covers the rest |
-| `--pad_vocab` / `--no-pad_vocab` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | Pad the vocab 50257 → 50304 so the LM-head matmuls use fast Hopper kernels (1.5× faster steps); trimmed back to 50257 before saving. `SEC_PER_STEP` assumes padding, so pass `--sec_per_step` with `--no-pad_vocab` |
-| `--fused_ce` / `--no-fused_ce` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | Liger fused LM head + cross-entropy (`liger-kernel`): no full fp32 logits, 1.24× faster steps, peak memory 65 → 24 GiB at 64/GPU. `SEC_PER_STEP` assumes it, so pass `--sec_per_step` with `--no-fused_ce` |
-| `--torch_compile` / `--no-torch_compile` | on in `run.sbatch` / `profile.sbatch` (off when calling `train.py` directly) | `torch.compile` each transformer block: fuses LayerNorm / cast / GELU / elementwise kernels, 1.12× faster steps (~4 s compile). Compiling the whole `model.transformer` instead made attention 2.7× slower |
-| `--attn_implementation` | `sdpa` | HF attention backend: `sdpa` (cuDNN flash), `flash_attention_2` / `flash_attention_3` (Hub kernels via `kernels`), `flash_attention_4` (`flash-attn-4`). FA3 / FA4 were no faster than `sdpa` here |
-| `--profile_dir` / `--profile_start` / `--profile_cpu` | off / `8` / on | Profile steps start+1..start+5 with torch.profiler (also inside a full run, e.g. `--profile_start=300`); `--no-profile_cpu` = GPU kernels only |
-| `--eval` / `--no-eval` | on | Periodic eval (`profile.sbatch` passes `--no-eval`) |
-| `--activation` | `gelu_pytorch_tanh` | MLP activation; same formula as GPT-2's `gelu_new` but one fused kernel |
-| `--optimizer` | `adamw` | `adamw`, `adam_mini`, or `muon` (Muon for the blocks' 2D weights + AdamW for the rest, `muon_adamw.py`; lost to AdamW by ~0.5 ppl at equal time). Muon runs ~5% slower per step, so size them with `--sec_per_step` (0.167 at batch 128) |
-| `--muon_lr` / `--muon_momentum` | `1.25e-3` / `0.95` | Muon peak LR (`match_rms_adamw` scaling; best tested, ≥ 1e-2 diverges) and Nesterov momentum |
-| `--weight_decay` | `0.01` | AdamW weight decay |
-| `--beta2` | `0.95` | Adam β2 |
-| `--warmup_frac` | `0.01` | Linear warmup over this fraction of the steps (1%: ppl 30.77; 10%: 32.34; 0.5%: 31.92) |
-| `--decay_frac` | `0.2` | `0`: constant after warmup; `>0`: warmup-stable-decay, linear decay to 0 over this fraction of the final steps |
-| `--dropout` | `0` | GPT-2's `resid_pdrop`, `attn_pdrop`, `embd_pdrop` (GPT-2 used 0.1) |
-| `--data_dir` | `/work/$USER/c4_gpt2` | Directory with `train.bin` and `val.bin` |
-| `--run_name` | none | W&B run name; also names the save directory |
-| `--save_dir` | `~/gpt2_models/<run_name or latest>` | Where the final model is saved |
+| `--token_budget` | `6e9` | Training tokens; steps = budget / (global batch x 8192). No padding, so every token counts |
+| `--global_batch_size` | `64` | Sequences per step (64 x 8192 = 0.5M tokens) |
+| `--per_device_batch` | `4` | Max sequences per GPU per micro-batch; grad accum covers the rest |
+| `--batch_ramp` | none | `"B1:f1,...,Bn"`: batch Bi for fraction fi of the token budget |
+| `--learning_rate` / `--weight_decay` / `--beta2` | `6e-4` / `0.1` / `0.95` | AdamW (untuned starting points) |
+| `--warmup_frac` / `--decay_frac` | `0.02` / `0.2` | Linear warmup, then WSD with linear decay to 0 over the final fraction |
+| `--optimizer` | `adamw` | `adamw` (fused torch AdamW), `adam_mini`, or `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`) |
+| `--muon_lr` / `--muon_momentum` | `1.25e-3` / `0.95` | Muon (tuned on GPT-2, re-tune) |
+| `--num_evals` | `20` | Evals over the run (lab: at least every 10% of steps) plus a final eval |
+| `--fused_ce` / `--torch_compile` | on in the sbatch scripts | Liger fused LM head + CE (no 4 GiB/seq fp32 logits); `torch.compile` per decoder layer |
+| `--attn_implementation` | `sdpa` | `sdpa`, `flash_attention_3`, `flash_attention_4` |
+| `--profile_dir` / `--profile_start` / `--profile_cpu` | off / `8` / on | torch.profiler over 5 steps |
+| `--data_dir` | `/work/$USER/dolma3_llama` | `train.bin` / `val.bin` |
+| `--save_dir` | `/work/$USER/llama_models/<run_name>` | Final model + tokenizer |
 
-The step count fills the 30-min job limit: `(TIME_BUDGET − 37 evals × EVAL_SEC) / SEC_PER_STEP[batch]`
-in `train.py` (batch 128 → 10334 steps). Warmup is 1% of the steps. If training runs slow, it stops 90 s before the limit and
-still saves the model. Losses go to W&B (`cerulean-labs/gpt2-training`) and `logs/<job-name>-<job-id>.out`.
+The training stops 5 min before the Slurm time limit (read from `squeue`) and still saves the model.
+
+W&B: `cerulean-labs/lab5-training-llama` on `https://app.forge.coreweave.com`. The lab's required metrics are
+`train/loss` (mean over the 10 logging steps), `train/grad_norm`, `train/learning_rate`, `train/tokens_per_second`
+(of that step), `train/total_tokens_seen`, and `eval/perplexity`. Extras: `train/mfu`, `train/ppl`, `eval/loss`.
 
 ## 3. Push to the Hub
 
-Training only saves the model locally, so the upload doesn't count against the job's time
-limit. After the job finishes, push from the login node. Uploading only uses the network,
-so it doesn't need Slurm:
-
 ```
 source .venv/bin/activate && source .env
-python push_model.py --model_dir ~/gpt2_models/my-run --repo_id $MODEL_NAME --message "my-run, eval 3.61"
+python push_model.py --model_dir /work/$USER/llama_models/my-run --repo_id $MODEL_NAME --message "my-run, eval ppl ..."
 ```
 
-The last lines of the training log print this command with the right paths.
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--model_dir` | required | Folder written by `train.py` |
-| `--repo_id` | `$MODEL_NAME` | Hub repo to push to |
-| `--message` | `Upload <folder name>` | Commit message |
-
-It uploads `config.json`, `generation_config.json` and `model.safetensors` as one commit. Each
-saved model takes ~500 MB of the 100 G `/home` quota; delete old ones from `~/gpt2_models/` once pushed.
-
-Experiment history and results: [`experiments.md`](experiments.md).
+This uploads the model, config, and tokenizer. Then set `eval_model_id` in the OJ script.

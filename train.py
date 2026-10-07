@@ -1,11 +1,11 @@
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback
-from datasets import load_dataset
+from transformers import AutoTokenizer, LlamaConfig, AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback
 import torch
 import numpy as np
 import math
 from torch.utils.data import DataLoader, Dataset
 import os
 import argparse
+import subprocess
 import time
 from torch.autograd import DeviceType
 from adam_mini import Adam_mini
@@ -17,78 +17,69 @@ START_TIME = time.time()
 print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)
 
 # Constants
-BLOCK_SIZE = 1024
+BLOCK_SIZE = 8192  # context window (DESCRIPTION.md)
+TOKENIZER = "unsloth/Llama-3.2-1B"  # ungated copy of meta-llama/Llama-3.2-1B's tokenizer (no access to the gated repo)
 
 # Argument
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name", type=str, required=True, help="Hub repo the saved model is meant for (pushed separately with push_model.py)")
-parser.add_argument("--learning_rate", type=float, default=1.25e-3, help="Peak LR, held constant after warmup")
-parser.add_argument("--warmup_frac", type=float, default=0.01, help="Linear warmup over this fraction of the steps (1%%: ppl 30.77 vs 32.34 at 10%%, 0.5%%: 31.92; jobs 504660, 504157, 504661)")
+parser.add_argument("--token_budget", type=float, default=6e9, help="Training tokens (lab cap 6B; every token of a step counts, there is no padding). Sets the step count")
+parser.add_argument("--learning_rate", type=float, default=6e-4, help="Peak LR (untuned starting point for 1B at ~0.5M-token batches)")
+parser.add_argument("--warmup_frac", type=float, default=0.02, help="Linear warmup over this fraction of the steps")
 parser.add_argument("--decay_frac", type=float, default=0.2, help="0: constant after warmup; >0: warmup-stable-decay, linear decay to 0 over this fraction of the final steps")
-parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay (GPT-1: 0.01, GPT-3/nanoGPT: 0.1)")
-parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for both optimizers (0.95: GPT-3/nanoGPT; 0.999: PyTorch default)")
-parser.add_argument("--global_batch_size", type=int, default=128, help="Sequences per optimizer step (per-GPU batch x grad accum x GPUs)")
-parser.add_argument("--batch_ramp", type=str, default=None, help='Global batch-size ramp "B1:f1,B2:f2,...,Bn": batch Bi for fraction fi of the training time, the last for the rest (e.g. "64:0.1,128"). One micro-batch of Bi/GPUs per GPU per step (no grad accum); overrides --global_batch_size / --per_device_batch')
-parser.add_argument("--per_device_batch", type=int, default=128, help="Max sequences per GPU per micro-batch; grad accum covers the rest")
-parser.add_argument("--dropout", type=float, default=0.0, help="Sets GPT-2's resid_pdrop, attn_pdrop and embd_pdrop (GPT-2 used 0.1; 0 won at < 0.2 epoch, job 500119)")
-parser.add_argument("--pad_vocab", action=argparse.BooleanOptionalAction, default=False, help="Pad the vocab 50257 -> 50304 (multiple of 128) for fast LM-head GEMMs; trimmed back before saving. On in run.sbatch/profile.sbatch; --no-pad_vocab disables")
-parser.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=False, help="Liger fused LM head + cross-entropy: never materializes the full fp32 logits. On in run.sbatch/profile.sbatch; --no-fused_ce disables")
+parser.add_argument("--weight_decay", type=float, default=0.1, help="AdamW weight decay (Llama 3 / GPT-3: 0.1)")
+parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for both optimizers (0.95: Llama/GPT-3; 0.999: PyTorch default)")
+parser.add_argument("--global_batch_size", type=int, default=64, help="Sequences of 8192 tokens per optimizer step (per-GPU batch x grad accum x GPUs); 64 = 0.5M tokens")
+parser.add_argument("--batch_ramp", type=str, default=None, help='Global batch-size ramp "B1:f1,B2:f2,...,Bn": batch Bi for fraction fi of the token budget, the last for the rest (e.g. "32:0.1,64"). One micro-batch of Bi/GPUs per GPU per step (no grad accum); overrides --global_batch_size / --per_device_batch')
+parser.add_argument("--per_device_batch", type=int, default=4, help="Max sequences per GPU per micro-batch; grad accum covers the rest")
+parser.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=False, help="Liger fused LM head + cross-entropy: never materializes the full fp32 logits (128k vocab x 8192 tokens = 4 GiB per sequence). On in run.sbatch/profile.sbatch; --no-fused_ce disables")
 parser.add_argument("--attn_implementation", type=str, default="sdpa", help="HF attention backend: sdpa (cuDNN flash), flash_attention_3 (Hub kernel kernels-community/vllm-flash-attn3 via `kernels`), flash_attention_4 (pip flash-attn-4, CuTe DSL)")
-parser.add_argument("--activation", type=str, default="gelu_pytorch_tanh", help="MLP activation: gelu_pytorch_tanh (fused, same formula) or gelu_new (GPT-2 original, ~8 elementwise kernels)")
-parser.add_argument("--sec_per_step", type=float, default=None, help="Override the measured train-step time (s, excl. eval) used to size the run")
-parser.add_argument("--max_steps", type=int, default=None, help="Override the time-budgeted step count (e.g. short speed tests)")
-parser.add_argument("--torch_compile", action=argparse.BooleanOptionalAction, default=False, help="torch.compile each transformer block (not the mask setup or the Liger loss): fuses LayerNorm/cast/GELU/elementwise kernels, 1.12x faster steps. On in run.sbatch/profile.sbatch; --no-torch_compile disables")
+parser.add_argument("--max_steps", type=int, default=None, help="Override the token-budget step count (e.g. short speed tests)")
+parser.add_argument("--num_evals", type=int, default=20, help="Evals over the run (lab: at least every 10%% of the steps)")
+parser.add_argument("--torch_compile", action=argparse.BooleanOptionalAction, default=False, help="torch.compile each decoder layer (not the rotary/mask setup or the Liger loss): fuses RMSNorm/cast/SwiGLU/elementwise kernels. On in run.sbatch/profile.sbatch; --no-torch_compile disables")
 parser.add_argument("--profile_dir", type=str, default=None, help="Profile 5 steps with torch.profiler into this dir; works inside a full run (see --profile_start) or in profile.sbatch")
 parser.add_argument("--profile_start", type=int, default=8, help="Profile steps profile_start+1 .. profile_start+5 (pick a window without an eval step in a full run, e.g. 300)")
 parser.add_argument("--profile_cpu", action=argparse.BooleanOptionalAction, default=True, help="Also record CPU ops (shows what causes GPU gaps, slightly slows launches); --no-profile_cpu = GPU kernels only")
 parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=True, help="Periodic eval (--no-eval for short speed/profile jobs, see profile.sbatch)")
-parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini) or muon (Muon for block matrices + AdamW for the rest, muon_adamw.py)")
-parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon: peak Muon LR (match_rms_adamw scaling; best of 1.25e-3..2e-2, >= 1e-2 diverges); --learning_rate is the AdamW part's")
+parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini) or muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py)")
+parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon: peak Muon LR (match_rms_adamw scaling; tuned on GPT-2, re-tune for Llama); --learning_rate is the AdamW part's")
 parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
-parser.add_argument("--data_dir", type=str, default=os.path.expandvars("/work/$USER/c4_gpt2"), help="Dir with train.bin and val.bin")
+parser.add_argument("--data_dir", type=str, default=os.path.expandvars("/work/$USER/dolma3_llama"), help="Dir with train.bin and val.bin (uint32, prepare_data.py)")
 parser.add_argument("--run_name", type=str, default=None, help="W&B run name; also isolates checkpoints in results/<run_name>")
-parser.add_argument("--save_dir", type=str, default=None, help="Where to save the final model (default: ~/gpt2_models/<run_name or latest>)")
+parser.add_argument("--save_dir", type=str, default=None, help="Where to save the final model + tokenizer (default: /work/$USER/llama_models/<run_name or latest>)")
 args = parser.parse_args()
 MODEL_NAME = args.model_name
 DATA_DIR = os.path.expanduser(args.data_dir)
-SAVE_DIR = os.path.expanduser(args.save_dir or os.path.join("~/gpt2_models", args.run_name or "latest"))
+SAVE_DIR = os.path.expanduser(args.save_dir or os.path.join(os.path.expandvars("/work/$USER/llama_models"), args.run_name or "latest"))
 
 print("Model name:", MODEL_NAME, "LR:", args.learning_rate, "Optimizer:", args.optimizer, *(["Muon LR:", args.muon_lr] if args.optimizer == "muon" else []), "WD:", args.weight_decay, "beta2:", args.beta2, "Run name:", args.run_name, "Data dir:", DATA_DIR)
 
-# The Hub upload runs after the job (push_model.py), so the 30-min limit only covers startup,
-# training and a local save: ~40 s startup, local save + W&B finish < 30 s.
-JOB_TIME_LIMIT = 1800
-# Measured in job 500119 (1449 s total): 9 s from script start to first step, 34 s outside the script
-# (venv/accelerate start + W&B finish after the save).
-TIME_BUDGET = JOB_TIME_LIMIT - 30 - 45 - 120  # startup, save + W&B finish + launcher, safety margin
-# Fixed number of evals (not fixed interval), so eval time doesn't grow when small batches run more steps.
-NUM_EVALS = 37
-EVAL_SEC = 2.6  # 5k val docs; measured 2.49 s/eval (max 2.54) with gelu_pytorch_tanh (job 500119); was 6.34 with gelu_new
-# Train-step time (s, excl. eval) on 2 GPUs by global batch size, with 24 CPUs, gelu_pytorch_tanh, up to
-# 64 seqs/GPU, dropout 0, --pad_vocab, --fused_ce and --torch_compile (the run.sbatch defaults).
-# 128: full-run mean 0.145 s (job 504863: (1557 s train_runtime - 66 s eval) / 10263) + ~1% margin.
-# 64 (32/GPU) and 256 (128/GPU, one micro-batch): speed-job medians 0.081 / 0.264 s (505613 / 505614) x 1.03 (full-run
-# mean / median, 505032). 128/GPU is 6% faster per token than 64/GPU x accum 2 (0.280 s) with compile.
-# 512: NOT measured with compile (no-compile value x 0.146 / 0.159). Re-measure with profile.sbatch if the setup changes.
-# --pad_vocab --fused_ce without compile (speed jobs 504142-504145 x 1.017): 64: 0.093, 128: 0.159, 256: 0.313, 512: 0.627.
-# --pad_vocab only (503436-503439): 64: 0.106, 128: 0.198, 256: 0.393, 512: 0.770.
-# Neither: 64: 0.161, 128: 0.298, 256: 0.606, 512: 1.208. Pass --sec_per_step to size such runs.
-# Before the throughput fixes (1 CPU, gelu_new, 32/GPU): 64: 0.249, 128: 0.469, 256: 0.912, 512: 1.824.
-SEC_PER_STEP = {64: 0.083, 128: 0.146, 256: 0.272, 512: 0.576}
-# Fewer, larger micro-batches: fewer kernel launches and fewer autocast weight casts per step (profile 499746).
-PER_DEVICE_BATCH = min(args.per_device_batch, args.global_batch_size // int(os.environ.get("WORLD_SIZE", 1)))
+
+def slurm_time_left():
+    """Seconds left in this Slurm job (squeue %L: [D-]HH:MM:SS, MM:SS), or None outside Slurm."""
+    job = os.environ.get("SLURM_JOB_ID")
+    if not job:
+        return None
+    try:
+        left = subprocess.run(["squeue", "-h", "-j", job, "-o", "%L"], capture_output=True, text=True, timeout=30).stdout.strip()
+        days, _, hms = left.rpartition("-")
+        parts = [int(x) for x in hms.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return int(days or 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except Exception as e:  # UNLIMITED, NOT_SET, squeue unavailable, ...
+        print("Could not read the Slurm time limit:", e)
+        return None
+
+
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+PER_DEVICE_BATCH = min(args.per_device_batch, args.global_batch_size // WORLD_SIZE)
 assert args.global_batch_size % (PER_DEVICE_BATCH * WORLD_SIZE) == 0, "global batch must be a multiple of per-GPU batch x GPUs"
 GRAD_ACCUM = args.global_batch_size // (PER_DEVICE_BATCH * WORLD_SIZE)
-sec_per_step = args.sec_per_step or SEC_PER_STEP.get(args.global_batch_size)
-if args.max_steps:
-    MAX_STEPS = args.max_steps
-else:
-    assert sec_per_step, f"no measured step time for batch {args.global_batch_size}; run a speed test or pass --sec_per_step"
-    MAX_STEPS = int((TIME_BUDGET - NUM_EVALS * EVAL_SEC) / sec_per_step)
-# Batch-size ramp: list of (global batch, optimizer steps). Each stage gets its fraction of the training time at its
-# own measured step time, so a ramp run spends the same wall time as a fixed-batch run. The LR schedule (warmup /
-# WSD decay) runs over the total optimizer steps, unchanged by the ramp.
+# Token budget -> steps. Every position of every sequence is a real token (packed documents, no padding).
+MAX_STEPS = args.max_steps or int(args.token_budget // (args.global_batch_size * BLOCK_SIZE))
+# Batch-size ramp: list of (global batch, optimizer steps). Each stage gets its fraction of the token budget. The LR
+# schedule (warmup / WSD decay) runs over the total optimizer steps, unchanged by the ramp.
 RAMP = None
 if args.batch_ramp:
     stages = [part.split(":") for part in args.batch_ramp.split(",")]
@@ -96,9 +87,7 @@ if args.batch_ramp:
     fracs = [float(st[1]) for st in stages[:-1]]
     fracs.append(1 - sum(fracs))
     assert all(b % WORLD_SIZE == 0 for b in sizes) and fracs[-1] > 0, args.batch_ramp
-    assert all(b in SEC_PER_STEP for b in sizes), f"no measured step time for some of {sizes}; run speed tests first"
-    train_time = TIME_BUDGET - NUM_EVALS * EVAL_SEC
-    RAMP = [(b, int(f * train_time / SEC_PER_STEP[b])) for b, f in zip(sizes, fracs)]
+    RAMP = [(b, int(f * args.token_budget // (b * BLOCK_SIZE))) for b, f in zip(sizes, fracs)]
     if args.max_steps:  # short tests: keep the stage proportions in steps
         total = sum(n for _, n in RAMP)
         RAMP = [(b, max(1, round(n * args.max_steps / total))) for b, n in RAMP]
@@ -116,6 +105,17 @@ def batch_at(step):
             return b
         step -= n
     return RAMP[-1][0]
+
+
+def tokens_seen(step):
+    """Training tokens processed up to and including optimizer step `step`."""
+    if RAMP is None:
+        return step * args.global_batch_size * BLOCK_SIZE
+    total = 0
+    for b, n in RAMP:
+        total += min(step, n) * b * BLOCK_SIZE
+        step -= min(step, n)
+    return total + step * RAMP[-1][0] * BLOCK_SIZE
 
 
 class RampBatchSampler:
@@ -144,69 +144,74 @@ class RampBatchSampler:
             pos += b
 
 
-EVAL_STEPS = max(1, MAX_STEPS // NUM_EVALS)
+EVAL_STEPS = max(1, MAX_STEPS // args.num_evals)
+if args.eval and EVAL_STEPS > max(1, MAX_STEPS // 10):
+    print(f"WARNING: eval every {EVAL_STEPS} steps is less often than the lab's 10% of {MAX_STEPS} steps")
+print(f"Token budget {args.token_budget:.3g} -> {MAX_STEPS} steps, {tokens_seen(MAX_STEPS):,} tokens, eval every {EVAL_STEPS}")
 if RAMP is None:
-    print(f"Global batch {args.global_batch_size} ({PER_DEVICE_BATCH}/GPU x grad accum {GRAD_ACCUM}), {MAX_STEPS} steps, eval every {EVAL_STEPS}")
-else:
-    print(f"Batch ramp {args.batch_ramp}: {MAX_STEPS} steps, eval every {EVAL_STEPS}")
+    print(f"Global batch {args.global_batch_size} x {BLOCK_SIZE} tokens ({PER_DEVICE_BATCH}/GPU x grad accum {GRAD_ACCUM} x {WORLD_SIZE} GPUs)")
+assert tokens_seen(MAX_STEPS) <= 6e9 or args.token_budget > 6e9, "over the 6B-token lab budget"
 WARMUP_STEPS = int(args.warmup_frac * MAX_STEPS)
 DECAY_STEPS = int(args.decay_frac * MAX_STEPS)
 
 # Prepare tokenizer and model
 print("=== Loading tokenizer and model...")
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
 
-# Weight init as in GPT-1/GPT-2: N(0, 0.02) for Linear/Conv1D/embedding weights, zero biases; GPT2's
-# _init_weights also scales each block's residual output proj (c_proj) by 1/sqrt(2 * n_layer).
-# 0.02 is already gpt2's config value; set explicitly so the choice is visible.
-# gelu_pytorch_tanh is the same tanh approximation as GPT-2's gelu_new, but one fused kernel instead of ~8
-# elementwise ones (generic elementwise kernels were ~29% of GPU time in profile 499746).
-config = AutoConfig.from_pretrained(
-    "gpt2", initializer_range=0.02, activation_function=args.activation,
-    resid_pdrop=args.dropout, attn_pdrop=args.dropout, embd_pdrop=args.dropout,
-    # The odd 50257 vocab sends the LM-head GEMMs to a slow sm75 cutlass kernel (~40% of GPU time, profile 503405).
-    # Padded rows never appear as targets; training just pushes their logits down.
-    **({"vocab_size": 50304} if args.pad_vocab else {}),
+# Llama 3.2 1B architecture (meta-llama/Llama-3.2-1B config.json), randomly initialized: N(0, 0.02) Linear/embedding
+# weights (LlamaPreTrainedModel._init_weights), tied embeddings, GQA 32 query / 8 KV heads, rope_theta 5e5 with the
+# llama3 RoPE scaling. Written out instead of loaded since the meta-llama repo is gated for us.
+# The 128,256 vocab is already a multiple of 128 (fast LM-head GEMMs), so no vocab padding is needed.
+config = LlamaConfig(
+    vocab_size=128256, hidden_size=2048, intermediate_size=8192, num_hidden_layers=16,
+    num_attention_heads=32, num_key_value_heads=8, head_dim=64, hidden_act="silu",
+    max_position_embeddings=131072, rms_norm_eps=1e-5, initializer_range=0.02, tie_word_embeddings=True,
+    rope_theta=500000.0,
+    rope_scaling={"rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                  "original_max_position_embeddings": 8192},
+    attention_bias=False, attention_dropout=0.0, mlp_bias=False,
+    bos_token_id=128000, eos_token_id=128001, pad_token_id=128004, use_cache=False,
 )
 model = AutoModelForCausalLM.from_config(config, attn_implementation=args.attn_implementation)
 print("Attention implementation:", model.config._attn_implementation)
+print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.3f}B")
 
 # Fused LM head + cross-entropy (Liger): computes the logits, loss and their gradients chunk by chunk inside
-# the forward, instead of HF's full (tokens x vocab) logits upcast to fp32 for log_softmax (~13% of GPU time and
-# most of the memory, profile 503423). Same shift and normalization as HF's ForCausalLMLoss: sum / num_items_in_batch
-# when the Trainer passes it (grad accum), else mean. Patched on the instance so the saved config stays GPT2LMHeadModel.
+# the forward, instead of HF's full (tokens x vocab) logits upcast to fp32 for log_softmax. Same shift and
+# normalization as HF's ForCausalLMLoss: sum / num_items_in_batch when the Trainer passes it (grad accum), else mean.
+# Patched on the instance so the saved config stays LlamaForCausalLM.
 if args.fused_ce:
     from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-    from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+    from transformers.modeling_outputs import CausalLMOutputWithPast
     fused_ce = {r: LigerFusedLinearCrossEntropyLoss(reduction=r) for r in ("mean", "sum")}
 
     def fused_ce_forward(input_ids=None, labels=None, num_items_in_batch=None, **kwargs):
-        hidden = model.transformer(input_ids=input_ids, **kwargs).last_hidden_state
+        hidden = model.model(input_ids=input_ids, **kwargs).last_hidden_state
         if labels is None:
-            return CausalLMOutputWithCrossAttentions(logits=model.lm_head(hidden))
+            return CausalLMOutputWithPast(logits=model.lm_head(hidden))
         hidden = hidden[:, :-1].reshape(-1, hidden.size(-1))  # tokens < n predict n
         targets = labels[:, 1:].reshape(-1)
         if num_items_in_batch is None:
             loss = fused_ce["mean"](model.lm_head.weight, hidden, targets)
         else:
             loss = fused_ce["sum"](model.lm_head.weight, hidden, targets) / num_items_in_batch
-        return CausalLMOutputWithCrossAttentions(loss=loss)
+        return CausalLMOutputWithPast(loss=loss)
 
     model.forward = fused_ce_forward
 
-# Compile only the transformer body: the memory-bound LayerNorm / cast / GELU / elementwise kernels are ~37% of GPU
-# time there (profile 504143), while the LM head + loss stays in Liger's kernels outside the compiled graph.
+# Compile only the decoder layers: the memory-bound RMSNorm / cast / SwiGLU / elementwise kernels, while the LM head +
+# loss stays in Liger's kernels outside the compiled graph (compiling the whole body made GPT-2's attention 2.7x slower).
 if args.torch_compile:
     if args.batch_ramp:  # a static recompile per batch size, not slower dynamic-shape kernels after the first change
         torch._dynamo.config.automatic_dynamic_shapes = False
-    for block in model.transformer.h:
-        block.compile()
+    for layer in model.model.layers:
+        layer.compile()
 
-# Load English C4 dataset
-print("=== Loading English C4 dataset...")
+# Load Dolma 3 (prepare_data.py): flat uint32 token files of <|begin_of_text|> doc <|end_of_text|>, packed into blocks
+print("=== Loading Dolma 3 tokens...")
 class TokenBlocks(Dataset):
     def __init__(self, path, block_size):
-        self.tokens = np.memmap(path, dtype=np.uint16, mode="r")  # lazy, no RAM blowup
+        self.tokens = np.memmap(path, dtype=np.uint32, mode="r")  # lazy, no RAM blowup
         self.block_size = block_size
 
     def __len__(self):
@@ -214,48 +219,51 @@ class TokenBlocks(Dataset):
 
     def __getitem__(self, i):
         x = torch.from_numpy(self.tokens[i * self.block_size : (i + 1) * self.block_size].astype(np.int64))
-        return {"input_ids": x, "labels": x}  # model shifts labels internally)
+        return {"input_ids": x, "labels": x}  # model shifts labels internally
 
 train_ds = TokenBlocks(os.path.join(DATA_DIR, "train.bin"), BLOCK_SIZE)
 val_ds = TokenBlocks(os.path.join(DATA_DIR, "val.bin"), BLOCK_SIZE)
+print(f"Train: {len(train_ds):,} blocks ({len(train_ds) * BLOCK_SIZE / 1e9:.2f}B tokens), val: {len(val_ds):,} blocks")
+# One pass at most: the budget must not repeat tokens unintentionally (repeats would count against it anyway)
+assert tokens_seen(MAX_STEPS) <= len(train_ds) * BLOCK_SIZE, "train.bin has fewer tokens than the budget; raise --train_frac in prepare_data.py"
 
 # Training arg
 training_args = TrainingArguments(
     output_dir=os.path.join("./results", args.run_name or ""),
     run_name=args.run_name,
-    # Global batch = per_device * grad_accum * num_gpus (default 32 * 2 * 2 = 128 sequences; GPT-1 used 512)
     per_device_train_batch_size=PER_DEVICE_BATCH,
+    per_device_eval_batch_size=PER_DEVICE_BATCH,
     gradient_accumulation_steps=GRAD_ACCUM,
     bf16=True,
     num_train_epochs=1,
     max_steps=MAX_STEPS,
+    max_grad_norm=1.0,
 
     # Logging, eval and reporting
     logging_steps=10,
-    report_to="wandb",  # Log to W&B
+    report_to="wandb",  # Log to W&B (project from WANDB_PROJECT, see run.sbatch)
     eval_strategy="steps" if args.eval else "no",
     eval_steps=EVAL_STEPS,
     save_strategy="no",
 
     # Optimizer
-    optim="adamw_torch",
+    optim="adamw_torch_fused",
     learning_rate=args.learning_rate,
     adam_beta1=0.9,
     adam_beta2=args.beta2,
     adam_epsilon=1e-8,
-    weight_decay=args.weight_decay,  # [choice] GPT-1 used 0.01; 0.1 is the GPT-3/nanoGPT value
+    weight_decay=args.weight_decay,
 
     # Scheduler: linear warmup then constant at peak (get_constant_schedule_with_warmup),
     # or with --decay_frac, warmup-stable-decay (get_wsd_schedule) with a final linear decay to 0.
-    # Was: cosine to 10% of peak ("cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": 0.1})
     lr_scheduler_type="warmup_stable_decay" if DECAY_STEPS else "constant_with_warmup",
     lr_scheduler_kwargs={"num_decay_steps": DECAY_STEPS, "decay_type": "linear"} if DECAY_STEPS else {},
-    warmup_steps=WARMUP_STEPS,  # --warmup_frac of the run (default 1%)
+    warmup_steps=WARMUP_STEPS,
 )
 print("=== Training arguments: ", training_args)
 
-# Safety net: if training runs slower than estimated (e.g. a slow node), stop early so the model
-# is still saved before Slurm kills the job. The LR decay is cut short in that case.
+# Safety net: stop early so the model is still saved before Slurm kills the job (e.g. a slow node, or a budget that
+# doesn't fit the job's time limit). The LR decay is cut short in that case.
 class DeadlineCallback(TrainerCallback):
     def __init__(self, deadline):
         self.deadline = deadline
@@ -269,11 +277,10 @@ class DeadlineCallback(TrainerCallback):
             control.should_training_stop = True
         return control
 
-# Times each optimizer step (on_step_begin -> on_step_end excludes eval) and prints the median at the end,
-# to fill SEC_PER_STEP for new batch sizes.
-# Model FLOPs per token (fwd + bwd): 6 * params + attention 12 * n_layer * n_embd * seq_len (PaLM/nanoGPT
+# Times each optimizer step (on_step_begin -> on_step_end excludes eval) and prints the median at the end.
+# Model FLOPs per token (fwd + bwd): 6 * params + attention 12 * n_layer * hidden * seq_len (PaLM/nanoGPT
 # MFU formula). Peak: H200 dense bf16 ~989 TFLOPS per GPU.
-FLOPS_PER_TOKEN = 6 * sum(p.numel() for p in model.parameters()) + 12 * config.n_layer * config.n_embd * BLOCK_SIZE
+FLOPS_PER_TOKEN = 6 * sum(p.numel() for p in model.parameters()) + 12 * config.num_hidden_layers * config.hidden_size * BLOCK_SIZE
 PEAK_FLOPS_PER_GPU = 989e12
 
 class StepTimerCallback(TrainerCallback):
@@ -289,10 +296,9 @@ class StepTimerCallback(TrainerCallback):
         if state.global_step == 1 and state.is_world_process_zero:  # includes torch.compile time if enabled
             print(f"=== First step done at {time.time() - START_TIME:.0f}s ({self.times[0]:.1f}s for step 1)")
 
-    def recent_throughput(self, num_steps):
-        """Training tokens/s (all GPUs) and MFU over the last num_steps optimizer steps, eval excluded."""
-        recent = self.times[-num_steps:]
-        tokens_per_sec = BLOCK_SIZE * sum(batch_at(s) for s in self.steps[-num_steps:]) / sum(recent)
+    def last_step_throughput(self):
+        """Training tokens/s (all GPUs) and MFU of the latest optimizer step (the lab logs it "on that step")."""
+        tokens_per_sec = BLOCK_SIZE * batch_at(self.steps[-1]) / self.times[-1]
         return tokens_per_sec, tokens_per_sec * FLOPS_PER_TOKEN / (PEAK_FLOPS_PER_GPU * WORLD_SIZE)
 
     def on_train_end(self, args, state, control, **kwargs):
@@ -302,12 +308,12 @@ class StepTimerCallback(TrainerCallback):
               f"reserved {torch.cuda.max_memory_reserved() / gib:.1f} GiB of {total / gib:.0f} GiB")
         if state.is_world_process_zero and len(self.times) > 10:
             t = sorted(self.times[5:])  # skip warm-up steps
-            print(f"=== Step time: median {t[len(t) // 2]:.3f} s over {len(t)} steps (excl. eval)")
+            med = t[len(t) // 2]
+            print(f"=== Step time: median {med:.3f} s over {len(t)} steps (excl. eval), "
+                  f"{BLOCK_SIZE * batch_at(state.global_step) / med:,.0f} tokens/s")
 
-# Optimizer. Adam-mini groups params by name: one lr per row for embeddings/MLP, one per tensor for the
-# rest. HF GPT-2 names: wte (matched), wpe (added below), attn.c_attn (fused QKV) and attn.c_proj are not
-# matched, so they get one lr per tensor; mlp.c_fc/c_proj are matched but are Conv1D (in, out), so
-# "per row" is per input feature rather than per output neuron.
+# Optimizer. Adam-mini recognizes the HF Llama names itself: embed_tokens (tied lm_head) one lr per row,
+# q_proj/k_proj one lr per head, the rest one per output neuron / tensor.
 optimizer = None
 if args.optimizer == "adam_mini":
     optimizer = Adam_mini(
@@ -316,11 +322,11 @@ if args.optimizer == "adam_mini":
         betas=(0.9, args.beta2),
         eps=1e-8,
         weight_decay=args.weight_decay,  # Adam-mini skips decay on norm and bias params itself
-        dim=config.n_embd,
-        n_heads=config.n_head,
+        dim=config.hidden_size,
+        n_heads=config.num_attention_heads,
+        n_kv_heads=config.num_key_value_heads,
         verbose=int(os.environ.get("LOCAL_RANK", 0)) == 0,
     )
-    optimizer.embd_names.add("wpe")
 elif args.optimizer == "muon":
     optimizer, muon_names, adamw_names = build_muon_adamw(
         model, muon_lr=args.muon_lr, muon_momentum=args.muon_momentum,
@@ -338,7 +344,7 @@ step_timer = StepTimerCallback()
 # above 100%). Same sum as the table footer: CPU ops (aten::mm) and GPU-side user annotations (ProfilerStep*,
 # DistributedDataParallel.forward) are excluded, since their self device time repeats the time of the kernels they
 # launch or enclose. The GPU is synchronized only at the two window edges (to time the window), so the CPU can queue
-# work ahead as in an unprofiled run; a sync after every step exposed the batch-loading gap as ~9% fake idle (504143).
+# work ahead as in an unprofiled run; a sync after every step exposed the batch-loading gap as ~9% fake idle.
 class ProfilerCallback(TrainerCallback):
     WARMUP, ACTIVE = 3, 5
 
@@ -395,23 +401,29 @@ class CustomTrainer(Trainer):
         return self.accelerator.prepare(DataLoader(self.train_dataset, batch_sampler=sampler,
                                                    collate_fn=self.data_collator, pin_memory=True))
 
-    # Log PPL
+    # Lab metrics. WandbCallback prefixes train logs with "train/" and "eval_*" with "eval/": loss (mean over the
+    # logging interval), grad_norm and learning_rate come from the Trainer; tokens_per_second (of the logging step
+    # itself), total_tokens_seen and eval_perplexity are added here.
     def log(self, logs, *args, **kwargs):
         if "loss" in logs:
             logs["ppl"] = math.exp(logs["loss"])
+            logs["total_tokens_seen"] = tokens_seen(self.state.global_step)
             if step_timer.times:
-                logs["tokens_per_sec"], logs["mfu"] = step_timer.recent_throughput(self.args.logging_steps)
+                logs["tokens_per_second"], logs["mfu"] = step_timer.last_step_throughput()
         if "eval_loss" in logs:
-            logs["eval_ppl"] = math.exp(logs["eval_loss"])
-        super().log(logs, *args, **kwargs) # Override the log to include perplexity (ppl)
+            logs["eval_perplexity"] = math.exp(logs["eval_loss"])
+        super().log(logs, *args, **kwargs)
 
 
+time_left = slurm_time_left()
+deadline = START_TIME + time_left - 300 if time_left else float("inf")  # leave 5 min for the final eval + save
+print("Deadline:", f"{(deadline - START_TIME) / 3600:.2f} h from start" if time_left else "none")
 trainer = CustomTrainer(
     model=model,
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=val_ds,
-    callbacks=[DeadlineCallback(START_TIME + JOB_TIME_LIMIT - 90), step_timer]
+    callbacks=[DeadlineCallback(deadline), step_timer]
     + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else []),
     optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
 )
@@ -419,23 +431,20 @@ trainer = CustomTrainer(
 # Train
 print("=== Starting training...")
 trainer.train()
-if args.pad_vocab:
-    model.resize_token_embeddings(len(tokenizer))  # drop padded rows (tied wte/lm_head) so the saved model is plain GPT-2
+if args.eval and trainer.state.global_step % EVAL_STEPS:  # final eval unless the last step just ran one
+    trainer.evaluate()
+print(f"=== Trained on {tokens_seen(trainer.state.global_step):,} tokens in {trainer.state.global_step} steps")
 trainer.save_model(SAVE_DIR)  # main process only; config + generation_config + safetensors
+if trainer.is_world_process_zero():
+    tokenizer.save_pretrained(SAVE_DIR)  # the OJ pulls the tokenizer from the same repo
+    # transformers 5 writes RoPE as "rope_parameters"; 4.x would ignore it and fall back to rope_theta 10000.
+    # Add the 4.x keys too so the model evaluates the same with either version.
+    import json
+    cfg_path = os.path.join(SAVE_DIR, "config.json")
+    cfg = json.load(open(cfg_path))
+    rope = dict(cfg.get("rope_parameters") or {})
+    cfg.setdefault("rope_theta", rope.pop("rope_theta", 500000.0))
+    cfg.setdefault("rope_scaling", rope or None)
+    json.dump(cfg, open(cfg_path, "w"), indent=2)
 print(f"=== Training finished. Saved to {SAVE_DIR} at {time.time() - START_TIME:.0f}s. Push with:")
 print(f"    python push_model.py --model_dir {SAVE_DIR} --repo_id {MODEL_NAME}")
-
-# OpenAI team hyperparameters
-"""
-Batch size: 512 sequences.
-Adam with a max learning rate of 2.5e-4
-Linear warmup over 2,000 updates, then cosine annealing
-Dropout of 0.1
-Modified L2 weight decay of 0.01
-
-If you're trying to reproduce GPT-2 training,
- community reproductions like Karpathy's nanoGPT and llm.c 
- are the practical reference. 
- They fill in the missing values, 
- for example a peak learning rate around 6e-4 for 124M and AdamW with betas (0.9, 0.95). Those values are their choices, not OpenAI's.
-"""
