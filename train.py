@@ -12,6 +12,7 @@ from torch.autograd import DeviceType
 from adam_mini import Adam_mini
 from muon_adamw import build_muon_adamw
 from sophia import SophiaG
+from soap_dist import DistributedSOAP
 
 START_TIME = time.time()
 
@@ -49,7 +50,13 @@ parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=Tru
 parser.add_argument("--ddp_find_unused", action=argparse.BooleanOptionalAction, default=False, help="DDP find_unused_parameters. Trainer would set True (no gradient checkpointing), but Llama has no unused params; off is ~1%% faster (experiments.md)")
 parser.add_argument("--ddp_bf16_grads", action=argparse.BooleanOptionalAction, default=False, help="All-reduce gradients in bf16 (DDP bf16_compress_hook): half the NCCL traffic, grads stay fp32 locally. No gain with 200 MB buckets")
 parser.add_argument("--ddp_bucket_cap_mb", type=int, default=200, help="DDP gradient bucket size; 200 MB vs torch's 25 MB: ~5%% faster on 8 GPUs and ~10 GiB less memory (experiments.md)")
-parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon", "sophia"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini), muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py) or sophia (SophiaG, official sophia.py; lr = --learning_rate)")
+parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon", "sophia", "soap"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini), muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py), sophia (SophiaG, official sophia.py) or soap (official soap.py, work split across GPUs by soap_dist.py); lr = --learning_rate for sophia and soap")
+parser.add_argument("--soap_betas", type=str, default="0.95,0.95", help="SOAP beta1,beta2 (official defaults; beta2 also drives the preconditioner EMA). Epsilon: --adam_eps")
+parser.add_argument("--soap_precond_freq", type=int, default=10, help="SOAP: re-estimate the preconditioner eigenbases every k steps (official default 10)")
+parser.add_argument("--soap_impl", type=str, default="official", choices=["official", "meta"], help="official: soap.py (paper authors) split across GPUs by soap_dist.py. meta: facebookresearch distributed_shampoo with DefaultSOAPConfig (ZeRO-1 over DDP ranks, one AllGather of the updates, blocked preconditioners)")
+parser.add_argument("--soap_block", type=int, default=8192, help="--soap_impl meta: max_preconditioner_dim; larger dims are split into blocks (8192: no layer matrix is split, the embedding is; README suggests 1024-8192)")
+parser.add_argument("--soap_comm_dtype", type=str, default="float32", choices=["float32", "bfloat16"], help="--soap_impl meta: dtype of the AllGather of the updates")
+parser.add_argument("--soap_max_precond_dim", type=int, default=10000, help="SOAP: dims above this are not preconditioned (official 10000: covers 8192, skips the 128k vocab)")
 parser.add_argument("--sophia_rho", type=float, default=0.05, help="SophiaG rho (clip threshold; official GPT-2 125M/770M: 0.05). Tune so train/sophia_win_rate stays in 0.1-0.5")
 parser.add_argument("--sophia_betas", type=str, default="0.965,0.99", help="SophiaG beta1,beta2 (official defaults)")
 parser.add_argument("--sophia_hess_interval", type=int, default=10, help="Re-estimate the diagonal Hessian (Gauss-Newton-Bartlett) every k steps (official: 10); one extra forward + backward of the full batch, i.e. ~1/k extra compute (official: same)")
@@ -420,6 +427,42 @@ elif args.optimizer == "sophia":
     )
     print(f"SophiaG: lr {args.learning_rate}, rho {args.sophia_rho}, betas {args.sophia_betas}, wd {args.weight_decay}, "
           f"bs {SOPHIA_BS:,} tokens, Hessian every {args.sophia_hess_interval} steps")
+
+elif args.optimizer == "soap" and args.soap_impl == "meta":
+    import distributed_shampoo as ds
+    # DistributedShampoo allocates and shards its state at construction: the model must already be on its GPU
+    # (training_args.device also initializes the process group).
+    model.to(training_args.device)
+    params = [p for p in model.parameters() if p.requires_grad]
+    betas = tuple(float(b) for b in args.soap_betas.split(","))
+    optimizer = ds.DistributedShampoo(
+        [  # matrices + embedding: SOAP (eigenvalue-corrected Shampoo, QR eigenbasis updates as in the SOAP paper)
+         {"params": [p for p in params if p.ndim >= 2], "weight_decay": args.weight_decay},
+         # RMSNorm weights: plain Adam, as official SOAP (precondition_1d=False), no weight decay
+         {"params": [p for p in params if p.ndim < 2], "weight_decay": 0.0, "start_preconditioning_step": math.inf,
+          "grafting_config": ds.AdamPreconditionerConfig(beta2=betas[1], epsilon=args.adam_eps)}],
+        lr=args.learning_rate, betas=betas, epsilon=args.adam_eps, weight_decay=args.weight_decay,
+        weight_decay_type=ds.WeightDecayType.DECOUPLED, max_preconditioner_dim=args.soap_block,
+        precondition_frequency=args.soap_precond_freq, use_bias_correction=True,
+        preconditioner_config=ds.DefaultSOAPConfig,
+        distributed_config=ds.DDPDistributedConfig(communication_dtype=getattr(torch, args.soap_comm_dtype),
+                                                   num_trainers_per_group=-1, communicate_params=False),
+    )
+    print(f"SOAP (meta distributed_shampoo): lr {args.learning_rate}, betas {args.soap_betas}, eps {args.adam_eps}, "
+          f"wd {args.weight_decay}, precondition every {args.soap_precond_freq} steps, block {args.soap_block}, "
+          f"AllGather in {args.soap_comm_dtype}")
+elif args.optimizer == "soap":
+    # Same decay split as the HF Trainer's AdamW (matrices + embedding; not the RMSNorm weights)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = DistributedSOAP(
+        [{"params": [p for p in params if p.ndim >= 2], "weight_decay": args.weight_decay},
+         {"params": [p for p in params if p.ndim < 2], "weight_decay": 0.0}],
+        lr=args.learning_rate, betas=tuple(float(b) for b in args.soap_betas.split(",")), eps=args.adam_eps,
+        weight_decay=args.weight_decay, precondition_frequency=args.soap_precond_freq,
+        max_precond_dim=args.soap_max_precond_dim,
+    )
+    print(f"SOAP: lr {args.learning_rate}, betas {args.soap_betas}, eps {args.adam_eps}, wd {args.weight_decay}, "
+          f"precondition every {args.soap_precond_freq} steps, max dim {args.soap_max_precond_dim}")
 
 # Sophia's Hessian estimate, as in the official train_sophiag.py: every k steps, after the optimizer step, forward +
 # backward the step's batch with labels sampled from the model, clip, and EMA the squared gradient into the Hessian.

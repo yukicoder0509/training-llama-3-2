@@ -11,3 +11,4 @@ kernels  # Hub attention kernels (flash_attention_2 / flash_attention_3)
 datatrove[io,processing]>=0.10  # dedup_filter.py (MinHash near-dedup, Gopher filters)
 spacy  # datatrove English word tokenizer
 matplotlib  # plot_runs.py
+torch-shampoo @ git+https://github.com/facebookresearch/optimizers.git@d24a1491797e5bf2c2985d8789f3a28293d87a6f  # --optimizer soap --soap_impl meta
