@@ -40,12 +40,12 @@ to fuse.
 - **Little left to gain from the existing flags:** every variant that keeps the setup is within ±2% of the default.
   Compile is worth +22% (keep). FA3 is level with cuDNN (+1%, noise). FA4 is 17% slower on the H200, with a
   3-minute compile.
-- 8 GPUs scale well: 51.3k vs 52.5k tokens/s/GPU (−2%). With accum 2 the all-reduce traffic doubles (1.49 vs 0.69 s
-  per 5 steps; HF Trainer seems to sync every micro-batch), but it overlaps the backward pass.
+- 8 GPUs scale well: 51.3k vs 52.5k tokens/s/GPU (−2%). With accum 2 the NCCL kernel time doubles (1.49 vs 0.69 s
+  per 5 steps), but it overlaps the backward pass. (Not a duplicate sync, as first guessed: see the DDP entry below.)
 - 8/GPU is +1.3% but uses 129 of 140 GiB, so any extra memory would OOM. Kept 4/GPU.
 - Throughput for planning: **~410k tokens/s on 8 GPUs → 6B tokens in ~4.1 h (~33 H200-hours)**, plus evals.
-- Larger gains need code changes, not flags: skip the duplicate all-reduce under grad accum, bf16 gradients or
-  all-reduce, Liger's RMSNorm/SwiGLU/RoPE kernels instead of compile, document masking (changes the math), FP8.
+- Larger gains need code changes, not flags: DDP settings (done, see the DDP entry below: +6%), bf16 gradients or
+  all-reduce (no gain there), Liger's RMSNorm/SwiGLU/RoPE kernels instead of compile, document masking (changes the math), FP8.
 
 ## 2026-10-08 — First real run: Llama 2/3 default hyperparameters, 1 h on 8 H200
 
@@ -92,3 +92,76 @@ Eval perplexity by tokens seen: 55M: 970 · 164M: 310 · 273M: 171 · 382M: 105 
 
 - Peak LR scan (e.g. 6e-4, 1.2e-3) and WSD vs cosine at this ~1 h scale.
 - For the ppl-20 baseline: the full budget is ~5.5× the tokens of this run.
+
+## 2026-10-08 — DDP settings: find_unused_parameters, bucket size, bf16 all-reduce (8 H200)
+
+**Question:** The flag sweep left communication as the only lead (8 GPUs were 2% slower per GPU than 2). Does
+the suspected duplicate gradient sync under grad accum exist, and do bf16 gradients help?
+
+**Duplicate sync: no.** The profiler traces of jobs 512020 (4/GPU × accum 2) and 512021 (8/GPU, no accum) have the same
+all-reduces: 335 per 5 steps, ~1.24B elements per step (one copy of the gradients). Trainer already wraps the
+first micro-batch in `no_sync`. With accum, the kernels take longer only because they run during the second micro-batch's
+compute. Every large all-reduce overlaps compute, and compute streams are idle only 2–3% of the time on both 2 and 8 GPUs.
+The real cost is contention: compute kernels take ~2% longer on 8 GPUs (6.23 vs 6.11 s per 5 steps).
+
+**Found in the Trainer code:** without gradient checkpointing, Trainer sets DDP `find_unused_parameters=True`. That means
+a graph walk every forward plus extra reducer work, though Llama has no unused parameters. New flags in `train.py`:
+`--ddp_find_unused`, `--ddp_bucket_cap_mb` (torch default 25 MB), and `--ddp_bf16_grads` (DDP `bf16_compress_hook`, via the
+Accelerate DDP handler).
+
+Setup: `profile.sbatch` on 8 GPUs, 40 steps (median over 35), toy data, AdamW, 4/GPU × accum 2 (global batch 64), dev partition.
+
+| Variant | Job | Median step | Tokens/s | vs baseline | Peak allocated |
+|---|---|---|---|---|---|
+| Baseline (find_unused on, 25 MB, fp32) | 514601 / 514624 | 1.280 / 1.295 s | 409.7k / 404.8k (mean 407k) | — | 79.2 GiB |
+| `--no-ddp_find_unused` | 514602 | 1.269 s | 413.2k | +1.5% | 79.2 GiB |
+| `--ddp_bf16_grads` | 514603 | 1.269 s | 413.0k | +1.4% | 80.0 GiB |
+| `--ddp_bucket_cap_mb=100` | 514604 | 1.233 s | 425.1k | +4.4% | 69.2 GiB |
+| no find_unused + 100 MB | 514622 | 1.218 s | 430.3k | +5.7% | 69.2 GiB |
+| no find_unused + 100 MB + bf16 | 514606 | 1.221 s | 429.3k | +5.5% | 70.1 GiB |
+| **no find_unused + 200 MB** | 514620 | 1.213 s | **432.4k** | **+6.2%** | 69.2 GiB |
+| no find_unused + 200 MB + bf16 | 514623 | 1.211 s | 432.9k | +6.3% | 70.0 GiB |
+| no find_unused + 500 MB | 514621 | 1.217 s | 430.8k | +5.8% | 69.2 GiB |
+| New defaults (re-run) | 514647 | 1.214 s | 431.7k | +6.0% | 69.2 GiB |
+| New defaults, `--per_device_batch=8` | 514648 | 1.211 s | 433.1k | +6.4% | 106.9 GiB |
+
+### Findings
+
+- **New defaults: `--no-ddp_find_unused --ddp_bucket_cap_mb=200`, +6% (407k → 432k tokens/s, 54.0k/GPU)**. That is now
+  faster per GPU than the old 2-GPU default (52.5k). Most of the gain is bucket size: 335 → 175 NCCL kernels per
+  5 steps (100 MB). The bucket size is flat from 100 to 500 MB.
+- Bigger buckets also cut peak memory by 10 GiB (79 → 69 GiB). This was not investigated further.
+- bf16 all-reduce: +1.4% with 25 MB buckets, no gain with large ones. It also reduces gradient precision across ranks.
+  Kept off (flag available).
+- Per-device batch 8 now fits easily (107 GiB) but adds only +0.3%. Kept 4.
+- Planning: 6B tokens on 8 GPUs ≈ 3.9 h (~31 H200-hours), down from 4.1 h.
+- The WSD 1 h run (job 514592) was started before this change, with the old DDP settings, so it is comparable to the cosine run.
+
+## 2026-10-08 — WSD vs cosine at the 1 h scale (8 H200)
+
+**Question:** The GPT-2 sweeps preferred WSD to cosine. Does that hold for the Llama 1 h run?
+
+Same settings as the cosine run (job 512100) except the schedule: peak 3e-4, warmup 2%, constant, then linear decay
+to 0 over the final 20% (`--lr_schedule=wsd --decay_frac=0.2`). Same data order (seed). Run with the old DDP settings,
+so the speed is comparable too.
+
+```
+sbatch --time=1:00:00 --job-name=llama-wsd-1h run.sbatch --run_name=llama-wsd-1h-8gpu --token_budget=1.1e9 --lr_schedule=wsd \
+    --decay_frac=0.2 --learning_rate=3e-4 --adam_eps=1e-5 --weight_decay=0.1 --beta2=0.95 --warmup_frac=0.02
+```
+
+| Schedule | Job | W&B run | Final eval ppl | Final eval loss | Train loss (last 100 steps) | Tokens/s | Job time |
+|---|---|---|---|---|---|---|---|
+| Cosine to 10% | 512100 | `dvqj42sv` | 50.68 | 3.926 | 3.73 | 400k | 51.6 min |
+| **WSD, 20% linear decay** | 514592 | `dkyqsbe6` | **38.00** | **3.637** | 3.48 | 397k | 52.1 min |
+
+Eval ppl by tokens seen (WSD / cosine): 273M: 172 / 171 · 491M: 73.9 / 79.6 · 709M: 50.8 / 59.3 · 818M: 46.0 / 55.2 ·
+927M (decay under way): 42.4 / 53.3 · 1.10B: **38.0 / 50.7**.
+
+### Findings
+
+- **WSD is much better: −0.29 nats eval loss (ppl 50.7 → 38.0)** at the same tokens and cost.
+- WSD is already ahead before its decay begins at 880M (46.0 vs 55.2 ppl at 818M). Its LR is still at the 3e-4 peak while
+  cosine has dropped to ~7e-5. So keeping the LR high helps, which suggests 3e-4 is too low a peak for this model and
+  batch. From 818M to the end, the decay plus the extra tokens give WSD a further −0.19 nats (ppl 46 → 38).
+- Next: a peak LR scan with WSD (6e-4, 1.2e-3; GPT-2 preferred ~5× the paper LR). Also try a decay fraction of 0.1–0.3.

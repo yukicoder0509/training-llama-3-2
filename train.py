@@ -44,6 +44,9 @@ parser.add_argument("--profile_dir", type=str, default=None, help="Profile 5 ste
 parser.add_argument("--profile_start", type=int, default=8, help="Profile steps profile_start+1 .. profile_start+5 (pick a window without an eval step in a full run, e.g. 300)")
 parser.add_argument("--profile_cpu", action=argparse.BooleanOptionalAction, default=True, help="Also record CPU ops (shows what causes GPU gaps, slightly slows launches); --no-profile_cpu = GPU kernels only")
 parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=True, help="Periodic eval (--no-eval for short speed/profile jobs, see profile.sbatch)")
+parser.add_argument("--ddp_find_unused", action=argparse.BooleanOptionalAction, default=False, help="DDP find_unused_parameters. Trainer would set True (no gradient checkpointing), but Llama has no unused params; off is ~1%% faster (experiments.md)")
+parser.add_argument("--ddp_bf16_grads", action=argparse.BooleanOptionalAction, default=False, help="All-reduce gradients in bf16 (DDP bf16_compress_hook): half the NCCL traffic, grads stay fp32 locally. No gain with 200 MB buckets")
+parser.add_argument("--ddp_bucket_cap_mb", type=int, default=200, help="DDP gradient bucket size; 200 MB vs torch's 25 MB: ~5%% faster on 8 GPUs and ~10 GiB less memory (experiments.md)")
 parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini) or muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py)")
 parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon: peak Muon LR (match_rms_adamw scaling; tuned on GPT-2, re-tune for Llama); --learning_rate is the AdamW part's")
 parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
@@ -249,6 +252,10 @@ training_args = TrainingArguments(
     eval_steps=EVAL_STEPS,
     save_strategy="no",
 
+    # DDP (see --ddp_* flags; the bf16 comm hook is set in CustomTrainer)
+    ddp_find_unused_parameters=args.ddp_find_unused,
+    ddp_bucket_cap_mb=args.ddp_bucket_cap_mb,
+
     # Optimizer
     optim="adamw_torch_fused",
     learning_rate=args.learning_rate,
@@ -399,6 +406,12 @@ class ProfilerCallback(TrainerCallback):
             print(events.table(sort_by=key, row_limit=25, max_name_column_width=60))
 
 class CustomTrainer(Trainer):
+    def create_accelerator_and_postprocess(self):
+        super().create_accelerator_and_postprocess()
+        if args.ddp_bf16_grads and self.accelerator.ddp_handler is not None:
+            from accelerate.utils import DDPCommunicationHookType
+            self.accelerator.ddp_handler.comm_hook = DDPCommunicationHookType.BF16  # registered when DDP wraps the model
+
     def get_train_dataloader(self):
         if RAMP is None:
             return super().get_train_dataloader()

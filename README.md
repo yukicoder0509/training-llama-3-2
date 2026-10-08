@@ -37,9 +37,9 @@ sbatch --gpus-per-node=2 --cpus-per-task=24 run.sbatch --run_name=baseline --tok
 sbatch profile.sbatch --per_device_batch=8              # 20-step speed / memory test, no W&B
 ```
 
-Measured on 8 H200 (job 512020, AdamW, compile + fused CE, 4 x 8192 tokens/GPU x accum 2): **410k tokens/s
-(51.3k/GPU, MFU ~55%), 80 GiB peak**, so 6B tokens take ~4.1 h (~33 H200-hours). Muon is ~4% slower, Adam-mini about
-the same. Flag sweep: experiments.md 2026-10-08.
+Measured on 8 H200 (job 514647, AdamW, compile + fused CE, 4 x 8192 tokens/GPU x accum 2, DDP 200 MB buckets without
+find_unused): **432k tokens/s (54.0k/GPU), 69 GiB peak**, so 6B tokens take ~3.9 h (~31 H200-hours). Muon is ~4% slower,
+Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -53,6 +53,7 @@ the same. Flag sweep: experiments.md 2026-10-08.
 | `--adam_eps` | `1e-8` | Adam ε (Llama 2: 1e-5) |
 | `--optimizer` | `adamw` | `adamw` (fused torch AdamW), `adam_mini`, or `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`) |
 | `--muon_lr` / `--muon_momentum` | `1.25e-3` / `0.95` | Muon (tuned on GPT-2, re-tune) |
+| `--ddp_find_unused` / `--ddp_bucket_cap_mb` / `--ddp_bf16_grads` | off / `200` / off | DDP settings (+6% vs Trainer's defaults of on / 25 MB); bf16 all-reduce gives no gain with large buckets |
 | `--num_evals` | `20` | Evals over the run (lab: at least every 10% of steps) plus a final eval |
 | `--fused_ce` / `--torch_compile` | on in the sbatch scripts | Liger fused LM head + CE (no 4 GiB/seq fp32 logits); `torch.compile` per decoder layer |
 | `--attn_implementation` | `sdpa` | `sdpa`, `flash_attention_3`, `flash_attention_4` |
