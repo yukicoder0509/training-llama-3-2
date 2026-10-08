@@ -51,8 +51,9 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--warmup_frac` / `--decay_frac` | `0.02` / `0.2` | Linear warmup, then WSD with linear decay to 0 over the final fraction |
 | `--lr_schedule` / `--min_lr_ratio` | `wsd` / `0.1` | `cosine`: cosine from the peak to `min_lr_ratio` × peak (Llama 2/3) |
 | `--adam_eps` | `1e-8` | Adam ε (Llama 2: 1e-5) |
-| `--optimizer` | `adamw` | `adamw` (fused torch AdamW), `adam_mini`, or `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`) |
+| `--optimizer` | `adamw` | `adamw` (fused torch AdamW), `adam_mini`, `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`), or `sophia` (SophiaG, `sophia.py` vendored from the official repo; LR = `--learning_rate`) |
 | `--muon_lr` / `--muon_momentum` | `1.25e-3` / `0.95` | Muon (tuned on GPT-2, re-tune) |
+| `--sophia_rho` / `--sophia_betas` / `--sophia_hess_interval` | `0.05` / `0.965,0.99` / `10` | SophiaG (official GPT-2 values). The Hessian pass every k steps reruns the step's batch with sampled labels: +1/k compute. Use weight decay ~2x AdamW's (0.2). Watch `train/sophia_win_rate` (official guidance: 0.1–0.5) |
 | `--ddp_find_unused` / `--ddp_bucket_cap_mb` / `--ddp_bf16_grads` | off / `200` / off | DDP settings (+6% vs Trainer's defaults of on / 25 MB); bf16 all-reduce gives no gain with large buckets |
 | `--num_evals` | `20` | Evals over the run (lab: at least every 10% of steps) plus a final eval |
 | `--fused_ce` / `--torch_compile` | on in the sbatch scripts | Liger fused LM head + CE (no 4 GiB/seq fp32 logits); `torch.compile` per decoder layer |
@@ -61,11 +62,21 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--data_dir` | `/work/$USER/dolma3_llama` | `train.bin` / `val.bin` |
 | `--save_dir` | `/work/$USER/llama_models/<run_name>` | Final model + tokenizer |
 
-The training stops 5 min before the Slurm time limit (read from `squeue`) and still saves the model.
+Runs are bounded by the token budget: the step count comes from `--token_budget`, and a run ends when those steps are
+done. The Slurm time limit is only a safety net. Training stops 5 min before it (read from `squeue`) and still saves
+the model, but that run saw fewer tokens and is not comparable. At step 50 the log prints the projected finish (or a
+WARNING if it is past the deadline), and the W&B summary records `budget_completed` and `final_tokens_seen`. Give
+comparison runs enough `--time` (e.g. 1:15 for a 1.1B-token run, which takes ~50 min).
 
 W&B: `cerulean-labs/lab5-training-llama` on `https://app.forge.coreweave.com`. The lab's required metrics are
 `train/loss` (mean over the 10 logging steps), `train/grad_norm`, `train/learning_rate`, `train/tokens_per_second`
 (of that step), `train/total_tokens_seen`, and `eval/perplexity`. Extras: `train/mfu`, `train/ppl`, `eval/loss`.
+All train and eval charts use `train/total_tokens_seen` as their x-axis (eval rows carry that key too). To plot runs
+against tokens locally (login node, reads W&B):
+
+```bash
+python plot_runs.py dvqj42sv dkyqsbe6 --out plots/wsd_vs_cosine_1h.png   # train/eval loss and ppl vs tokens seen
+```
 
 ## 3. Push to the Hub
 

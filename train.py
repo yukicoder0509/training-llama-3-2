@@ -5,11 +5,13 @@ import math
 from torch.utils.data import DataLoader, Dataset
 import os
 import argparse
+import contextlib
 import subprocess
 import time
 from torch.autograd import DeviceType
 from adam_mini import Adam_mini
 from muon_adamw import build_muon_adamw
+from sophia import SophiaG
 
 START_TIME = time.time()
 
@@ -47,7 +49,10 @@ parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=Tru
 parser.add_argument("--ddp_find_unused", action=argparse.BooleanOptionalAction, default=False, help="DDP find_unused_parameters. Trainer would set True (no gradient checkpointing), but Llama has no unused params; off is ~1%% faster (experiments.md)")
 parser.add_argument("--ddp_bf16_grads", action=argparse.BooleanOptionalAction, default=False, help="All-reduce gradients in bf16 (DDP bf16_compress_hook): half the NCCL traffic, grads stay fp32 locally. No gain with 200 MB buckets")
 parser.add_argument("--ddp_bucket_cap_mb", type=int, default=200, help="DDP gradient bucket size; 200 MB vs torch's 25 MB: ~5%% faster on 8 GPUs and ~10 GiB less memory (experiments.md)")
-parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini) or muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py)")
+parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon", "sophia"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini), muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py) or sophia (SophiaG, official sophia.py; lr = --learning_rate)")
+parser.add_argument("--sophia_rho", type=float, default=0.05, help="SophiaG rho (clip threshold; official GPT-2 125M/770M: 0.05). Tune so train/sophia_win_rate stays in 0.1-0.5")
+parser.add_argument("--sophia_betas", type=str, default="0.965,0.99", help="SophiaG beta1,beta2 (official defaults)")
+parser.add_argument("--sophia_hess_interval", type=int, default=10, help="Re-estimate the diagonal Hessian (Gauss-Newton-Bartlett) every k steps (official: 10); one extra forward + backward of the full batch, i.e. ~1/k extra compute (official: same)")
 parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon: peak Muon LR (match_rms_adamw scaling; tuned on GPT-2, re-tune for Llama); --learning_rate is the AdamW part's")
 parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
 parser.add_argument("--data_dir", type=str, default=os.path.expandvars("/work/$USER/dolma3_llama"), help="Dir with train.bin and val.bin (uint32, prepare_data.py)")
@@ -191,8 +196,10 @@ if args.fused_ce:
     from transformers.modeling_outputs import CausalLMOutputWithPast
     fused_ce = {r: LigerFusedLinearCrossEntropyLoss(reduction=r) for r in ("mean", "sum")}
 
-    def fused_ce_forward(input_ids=None, labels=None, num_items_in_batch=None, **kwargs):
+    def fused_ce_forward(input_ids=None, labels=None, num_items_in_batch=None, sample_labels=False, **kwargs):
         hidden = model.model(input_ids=input_ids, **kwargs).last_hidden_state
+        if sample_labels:  # Sophia's Hessian estimate: mean CE against labels drawn from the model's own predictions
+            return CausalLMOutputWithPast(loss=sampled_label_loss(hidden))
         if labels is None:
             return CausalLMOutputWithPast(logits=model.lm_head(hidden))
         hidden = hidden[:, :-1].reshape(-1, hidden.size(-1))  # tokens < n predict n
@@ -202,6 +209,18 @@ if args.fused_ce:
         else:
             loss = fused_ce["sum"](model.lm_head.weight, hidden, targets) / num_items_in_batch
         return CausalLMOutputWithPast(loss=loss)
+
+    def sampled_label_loss(hidden, chunk=2048):
+        """CE of every position against y ~ softmax(logits) (official train_sophiag.py), without the full logits:
+        exact categorical samples by Gumbel-max (argmax of logits - log Exp(1)) chunk by chunk."""
+        h = hidden.reshape(-1, hidden.size(-1))
+        w = model.lm_head.weight
+        with torch.no_grad():
+            samples = []
+            for c in h.split(chunk):
+                logits = (c @ w.t()).float()
+                samples.append(logits.sub_(torch.empty_like(logits).exponential_().log_()).argmax(-1))
+        return fused_ce["mean"](w, h, torch.cat(samples))
 
     model.forward = fused_ce_forward
 
@@ -274,20 +293,51 @@ training_args = TrainingArguments(
 )
 print("=== Training arguments: ", training_args)
 
-# Safety net: stop early so the model is still saved before Slurm kills the job (e.g. a slow node, or a budget that
-# doesn't fit the job's time limit). The LR decay is cut short in that case.
+# Runs are bounded by the token budget: MAX_STEPS = budget / tokens per step, and training ends after MAX_STEPS. The job
+# time limit is only a safety net: stop early so the model is still saved before Slurm kills the job (slow node, or
+# a --time too short for the budget). Such a run saw fewer tokens and its LR decay was cut short, so it is not
+# comparable to others. It warns as early as step 50 if the projected finish is past the deadline, and records
+# budget_completed in the W&B summary (see the end of the script).
 class DeadlineCallback(TrainerCallback):
+    PROJECT_AT = 50  # compile and warm-up are done by then
+
     def __init__(self, deadline):
         self.deadline = deadline
+        self.t_project = None
 
     def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == self.PROJECT_AT // 2:
+            self.t_project = time.time()
+        elif state.global_step == self.PROJECT_AT and self.t_project and state.is_world_process_zero:
+            per_step = (time.time() - self.t_project) / (self.PROJECT_AT - self.PROJECT_AT // 2)  # includes evals in that window
+            finish = time.time() + per_step * (state.max_steps - state.global_step)
+            if finish > self.deadline:
+                print(f"=== WARNING: projected finish {(finish - START_TIME) / 60:.0f} min after start is past the deadline "
+                      f"({(self.deadline - START_TIME) / 60:.0f} min): the run will stop before the token budget. Raise --time.")
+            else:
+                print(f"=== Projected finish {(finish - START_TIME) / 60:.0f} min after start (deadline {(self.deadline - START_TIME) / 60:.0f} min), plus evals")
         stop = torch.tensor(float(time.time() > self.deadline), device=args.device)
         if torch.distributed.is_initialized():  # all ranks must stop at the same step or the next collective hangs
             torch.distributed.all_reduce(stop, op=torch.distributed.ReduceOp.MAX)
         if stop.item():
-            print(f"=== Deadline reached at step {state.global_step}/{state.max_steps}, stopping to save the model")
+            print(f"=== WARNING: deadline reached at step {state.global_step}/{state.max_steps}, stopping to save the model. "
+                  f"The token budget was NOT completed; this run is not comparable to full-budget runs.")
             control.should_training_stop = True
         return control
+
+# W&B x-axis: tokens seen instead of the Trainer's global step, for train and eval charts alike. Eval rows carry the
+# same key: CustomTrainer.log adds total_tokens_seen to eval logs, and WandbCallback prefixes it "train/" (no eval_ prefix).
+# Runs after WandbCallback.on_train_begin (user callbacks come after the reporting ones), i.e. after wandb.init.
+TOKEN_AXIS_METRICS = ["train/loss", "train/ppl", "train/grad_norm", "train/learning_rate", "train/tokens_per_second",
+                      "train/mfu", "train/sophia_win_rate", "eval/loss", "eval/perplexity"]
+
+class WandbTokenAxisCallback(TrainerCallback):
+    def on_train_begin(self, args, state, control, **kwargs):
+        import wandb
+        if state.is_world_process_zero and wandb.run is not None:
+            wandb.define_metric("train/total_tokens_seen")
+            for key in TOKEN_AXIS_METRICS:  # explicit names take precedence over WandbCallback's "*" -> global_step
+                wandb.define_metric(key, step_metric="train/total_tokens_seen")
 
 # Times each optimizer step (on_step_begin -> on_step_end excludes eval) and prints the median at the end.
 # Model FLOPs per token (fwd + bwd): 6 * params + attention 12 * n_layer * hidden * seq_len (PaLM/nanoGPT
@@ -321,8 +371,10 @@ class StepTimerCallback(TrainerCallback):
         if state.is_world_process_zero and len(self.times) > 10:
             t = sorted(self.times[5:])  # skip warm-up steps
             med = t[len(t) // 2]
-            print(f"=== Step time: median {med:.3f} s over {len(t)} steps (excl. eval), "
-                  f"{BLOCK_SIZE * batch_at(state.global_step) / med:,.0f} tokens/s")
+            mean = sum(t) / len(t)  # differs from the median when some steps do extra work (Sophia's Hessian pass)
+            print(f"=== Step time: median {med:.3f} s, mean {mean:.3f} s over {len(t)} steps (excl. eval), "
+                  f"{BLOCK_SIZE * batch_at(state.global_step) / med:,.0f} tokens/s at the median, "
+                  f"{BLOCK_SIZE * batch_at(state.global_step) / mean:,.0f} at the mean")
 
 # Optimizer. Adam-mini recognizes the HF Llama names itself: embed_tokens (tied lm_head) one lr per row,
 # q_proj/k_proj one lr per head, the rest one per output neuron / tensor.
@@ -347,6 +399,52 @@ elif args.optimizer == "muon":
     n = dict(model.named_parameters())
     print(f"Muon: {len(muon_names)} tensors, {sum(n[k].numel() for k in muon_names) / 1e6:.1f}M params, lr {args.muon_lr}; "
           f"AdamW: {len(adamw_names)} tensors, {sum(n[k].numel() for k in adamw_names) / 1e6:.1f}M params, lr {args.learning_rate}")
+
+elif args.optimizer == "sophia":
+    assert args.fused_ce, "--optimizer sophia samples labels inside the fused CE forward; use --fused_ce"
+    assert RAMP is None, "--optimizer sophia: bs (tokens per step) is fixed; no --batch_ramp"
+    SOPHIA_BS = args.global_batch_size * BLOCK_SIZE  # official: step(bs=total_bs * block_size), tokens per step
+
+    class SophiaGTrainer(SophiaG):
+        """The HF Trainer calls optimizer.step() without SophiaG's bs argument."""
+        def step(self, closure=None, bs=None):
+            return super().step(closure, bs=SOPHIA_BS)
+
+    # Same decay split as the HF Trainer's AdamW (matrices + embedding; not the RMSNorm weights)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = SophiaGTrainer(
+        [{"params": [p for p in params if p.ndim >= 2], "weight_decay": args.weight_decay},
+         {"params": [p for p in params if p.ndim < 2], "weight_decay": 0.0}],
+        lr=args.learning_rate, betas=tuple(float(b) for b in args.sophia_betas.split(",")), rho=args.sophia_rho,
+        weight_decay=args.weight_decay,
+    )
+    print(f"SophiaG: lr {args.learning_rate}, rho {args.sophia_rho}, betas {args.sophia_betas}, wd {args.weight_decay}, "
+          f"bs {SOPHIA_BS:,} tokens, Hessian every {args.sophia_hess_interval} steps")
+
+# Sophia's Hessian estimate, as in the official train_sophiag.py: every k steps, after the optimizer step, forward +
+# backward the step's batch with labels sampled from the model, clip, and EMA the squared gradient into the Hessian.
+# Reuses the step's own micro-batches (official: the next batches) so no extra data tokens are consumed. Gradients
+# are averaged over all GPUs through DDP, so every rank keeps the same Hessian. Also logs the "win rate" (fraction of
+# coordinates whose update is not clipped, official train/win_rate; should stay ~0.1-0.5, else tune rho).
+sophia_stats = {}
+
+class SophiaHessianCallback(TrainerCallback):
+    def on_step_end(self, args_, state, control, **kwargs):
+        if state.global_step % args.sophia_hess_interval:
+            return
+        ddp_model, batches = trainer.model_wrapped, trainer.step_batches
+        for i, inputs in enumerate(batches):
+            sync = contextlib.nullcontext() if i == len(batches) - 1 or ddp_model is model else ddp_model.no_sync()
+            with sync, trainer.compute_loss_context_manager():
+                loss = ddp_model(input_ids=inputs["input_ids"], sample_labels=True).loss / len(batches)
+                loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args_.max_grad_norm)
+        optimizer.update_hessian()
+        optimizer.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            unclipped = sum((st["exp_avg"].abs() < args.sophia_rho * SOPHIA_BS * st["hessian"]).sum()
+                            for st in optimizer.state.values())
+            sophia_stats["sophia_win_rate"] = (unclipped / sum(st["exp_avg"].numel() for st in optimizer.state.values())).item()
 
 # Trainer
 step_timer = StepTimerCallback()
@@ -406,6 +504,15 @@ class ProfilerCallback(TrainerCallback):
             print(events.table(sort_by=key, row_limit=25, max_name_column_width=60))
 
 class CustomTrainer(Trainer):
+    step_batches, _batches_step = [], -1
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        if args.optimizer == "sophia":  # keep this optimizer step's micro-batches for the Hessian estimate
+            if self._batches_step != self.state.global_step:
+                self.step_batches, self._batches_step = [], self.state.global_step
+            self.step_batches.append(inputs)
+        return super().training_step(model, inputs, num_items_in_batch)
+
     def create_accelerator_and_postprocess(self):
         super().create_accelerator_and_postprocess()
         if args.ddp_bf16_grads and self.accelerator.ddp_handler is not None:
@@ -428,6 +535,7 @@ class CustomTrainer(Trainer):
             logs["total_tokens_seen"] = tokens_seen(self.state.global_step)
             if step_timer.times:
                 logs["tokens_per_second"], logs["mfu"] = step_timer.last_step_throughput()
+            logs.update(sophia_stats)
         if "eval_loss" in logs:
             logs["total_tokens_seen"] = tokens_seen(self.state.global_step)  # x-axis for eval/perplexity vs tokens
             logs["eval_perplexity"] = math.exp(logs["eval_loss"])
@@ -442,7 +550,9 @@ trainer = CustomTrainer(
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=val_ds,
-    callbacks=[DeadlineCallback(deadline), step_timer]
+    # Sophia's Hessian pass before step_timer, so its time counts in tokens_per_second / MFU
+    callbacks=([SophiaHessianCallback()] if args.optimizer == "sophia" else [])
+    + [DeadlineCallback(deadline), step_timer, WandbTokenAxisCallback()]
     + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else []),
     optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
 )
@@ -452,7 +562,13 @@ print("=== Starting training...")
 trainer.train()
 if args.eval and trainer.state.global_step % EVAL_STEPS:  # final eval unless the last step just ran one
     trainer.evaluate()
-print(f"=== Trained on {tokens_seen(trainer.state.global_step):,} tokens in {trainer.state.global_step} steps")
+BUDGET_COMPLETED = trainer.state.global_step >= MAX_STEPS
+print(f"=== Trained on {tokens_seen(trainer.state.global_step):,} tokens in {trainer.state.global_step}/{MAX_STEPS} steps"
+      + ("" if BUDGET_COMPLETED else " -- WARNING: token budget NOT completed (deadline)"))
+if trainer.is_world_process_zero():
+    import wandb
+    if wandb.run is not None:  # filter / check runs by this in W&B before comparing them
+        wandb.run.summary.update({"budget_completed": BUDGET_COMPLETED, "final_tokens_seen": tokens_seen(trainer.state.global_step)})
 trainer.save_model(SAVE_DIR)  # main process only; config + generation_config + safetensors
 if trainer.is_world_process_zero():
     tokenizer.save_pretrained(SAVE_DIR)  # the OJ pulls the tokenizer from the same repo
