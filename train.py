@@ -18,7 +18,7 @@ print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)
 
 # Constants
 BLOCK_SIZE = 8192  # context window (DESCRIPTION.md)
-TOKENIZER = "unsloth/Llama-3.2-1B"  # ungated copy of meta-llama/Llama-3.2-1B's tokenizer (no access to the gated repo)
+TOKENIZER = "NousResearch/Llama-3.2-1B"  # tokenizer.json byte-identical to meta-llama/Llama-3.2-1B (gated for us)
 
 # Argument
 parser = argparse.ArgumentParser()
@@ -26,7 +26,10 @@ parser.add_argument("--model_name", type=str, required=True, help="Hub repo the 
 parser.add_argument("--token_budget", type=float, default=6e9, help="Training tokens (lab cap 6B; every token of a step counts, there is no padding). Sets the step count")
 parser.add_argument("--learning_rate", type=float, default=6e-4, help="Peak LR (untuned starting point for 1B at ~0.5M-token batches)")
 parser.add_argument("--warmup_frac", type=float, default=0.02, help="Linear warmup over this fraction of the steps")
-parser.add_argument("--decay_frac", type=float, default=0.2, help="0: constant after warmup; >0: warmup-stable-decay, linear decay to 0 over this fraction of the final steps")
+parser.add_argument("--decay_frac", type=float, default=0.2, help="--lr_schedule wsd: 0 = constant after warmup; >0 = linear decay to 0 over this fraction of the final steps")
+parser.add_argument("--lr_schedule", type=str, default="wsd", choices=["wsd", "cosine"], help="wsd (warmup-stable-decay, see --decay_frac) or cosine (Llama 2/3: warmup, then cosine to --min_lr_ratio x peak)")
+parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="--lr_schedule cosine: final LR / peak (Llama 2: 0.1)")
+parser.add_argument("--adam_eps", type=float, default=1e-8, help="Adam epsilon (Llama 2: 1e-5)")
 parser.add_argument("--weight_decay", type=float, default=0.1, help="AdamW weight decay (Llama 3 / GPT-3: 0.1)")
 parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for both optimizers (0.95: Llama/GPT-3; 0.999: PyTorch default)")
 parser.add_argument("--global_batch_size", type=int, default=64, help="Sequences of 8192 tokens per optimizer step (per-GPU batch x grad accum x GPUs); 64 = 0.5M tokens")
@@ -251,13 +254,15 @@ training_args = TrainingArguments(
     learning_rate=args.learning_rate,
     adam_beta1=0.9,
     adam_beta2=args.beta2,
-    adam_epsilon=1e-8,
+    adam_epsilon=args.adam_eps,
     weight_decay=args.weight_decay,
 
     # Scheduler: linear warmup then constant at peak (get_constant_schedule_with_warmup),
-    # or with --decay_frac, warmup-stable-decay (get_wsd_schedule) with a final linear decay to 0.
-    lr_scheduler_type="warmup_stable_decay" if DECAY_STEPS else "constant_with_warmup",
-    lr_scheduler_kwargs={"num_decay_steps": DECAY_STEPS, "decay_type": "linear"} if DECAY_STEPS else {},
+    # or with --decay_frac, warmup-stable-decay (get_wsd_schedule) with a final linear decay to 0,
+    # or with --lr_schedule cosine, cosine from the peak to min_lr_ratio x peak (Llama 2 / 3).
+    lr_scheduler_type="cosine_with_min_lr" if args.lr_schedule == "cosine" else "warmup_stable_decay" if DECAY_STEPS else "constant_with_warmup",
+    lr_scheduler_kwargs={"min_lr_rate": args.min_lr_ratio} if args.lr_schedule == "cosine"
+    else {"num_decay_steps": DECAY_STEPS, "decay_type": "linear"} if DECAY_STEPS else {},
     warmup_steps=WARMUP_STEPS,
 )
 print("=== Training arguments: ", training_args)
@@ -320,7 +325,7 @@ if args.optimizer == "adam_mini":
         named_parameters=model.named_parameters(),
         lr=args.learning_rate,
         betas=(0.9, args.beta2),
-        eps=1e-8,
+        eps=args.adam_eps,
         weight_decay=args.weight_decay,  # Adam-mini skips decay on norm and bias params itself
         dim=config.hidden_size,
         n_heads=config.num_attention_heads,
@@ -411,6 +416,7 @@ class CustomTrainer(Trainer):
             if step_timer.times:
                 logs["tokens_per_second"], logs["mfu"] = step_timer.last_step_throughput()
         if "eval_loss" in logs:
+            logs["total_tokens_seen"] = tokens_seen(self.state.global_step)  # x-axis for eval/perplexity vs tokens
             logs["eval_perplexity"] = math.exp(logs["eval_loss"])
         super().log(logs, *args, **kwargs)
 

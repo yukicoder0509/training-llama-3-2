@@ -26,7 +26,7 @@ Downloads the dataset (~110 GB, pinned revision) and writes to `$OUT_DIR` (defau
 - `eval_docs.jsonl`: all 50k held-out texts, for exact OJ-style evaluation later. Also `meta.json` with the counts.
 
 Tokens are uint32 (Llama 3 vocab 128,256), one doc = `<|begin_of_text|> text <|end_of_text|>`, packed into 8192 blocks.
-The tokenizer is `unsloth/Llama-3.2-1B` (an ungated copy of Meta's; we have no access to `meta-llama/*`). The data is not cleaned.
+The tokenizer is `NousResearch/Llama-3.2-1B` (its `tokenizer.json` is byte-identical to the gated `meta-llama/Llama-3.2-1B`). The data is not cleaned.
 (`dedup_filter.py` / `dedup_filter.sbatch` are the old C4 pipelines, not yet ported.)
 
 ## 2. Train
@@ -37,8 +37,9 @@ sbatch --gpus-per-node=2 --cpus-per-task=24 run.sbatch --run_name=baseline --tok
 sbatch profile.sbatch --per_device_batch=8              # 20-step speed / memory test, no W&B
 ```
 
-Measured (job 511900, 2 H200, AdamW, compile + fused CE, 4 x 8192 tokens/GPU): **~52.6k tokens/s/GPU, MFU 56%,
-79 GiB peak**. That makes 6B tokens on 8 GPUs about 4 h (~32 H200-hours). Muon is ~4% slower, Adam-mini about the same.
+Measured on 8 H200 (job 512020, AdamW, compile + fused CE, 4 x 8192 tokens/GPU x accum 2): **410k tokens/s
+(51.3k/GPU, MFU ~55%), 80 GiB peak**, so 6B tokens take ~4.1 h (~33 H200-hours). Muon is ~4% slower, Adam-mini about
+the same. Flag sweep: experiments.md 2026-10-08.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -48,6 +49,8 @@ Measured (job 511900, 2 H200, AdamW, compile + fused CE, 4 x 8192 tokens/GPU): *
 | `--batch_ramp` | none | `"B1:f1,...,Bn"`: batch Bi for fraction fi of the token budget |
 | `--learning_rate` / `--weight_decay` / `--beta2` | `6e-4` / `0.1` / `0.95` | AdamW (untuned starting points) |
 | `--warmup_frac` / `--decay_frac` | `0.02` / `0.2` | Linear warmup, then WSD with linear decay to 0 over the final fraction |
+| `--lr_schedule` / `--min_lr_ratio` | `wsd` / `0.1` | `cosine`: cosine from the peak to `min_lr_ratio` × peak (Llama 2/3) |
+| `--adam_eps` | `1e-8` | Adam ε (Llama 2: 1e-5) |
 | `--optimizer` | `adamw` | `adamw` (fused torch AdamW), `adam_mini`, or `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`) |
 | `--muon_lr` / `--muon_momentum` | `1.25e-3` / `0.95` | Muon (tuned on GPT-2, re-tune) |
 | `--num_evals` | `20` | Evals over the run (lab: at least every 10% of steps) plus a final eval |

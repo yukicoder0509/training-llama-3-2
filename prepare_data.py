@@ -36,7 +36,7 @@ SEED = 42
 @dataclass
 class PrepareArguments:
     out_dir: str = field(default=os.path.expandvars("/work/$USER/dolma3_llama"))
-    tokenizer: str = field(default="unsloth/Llama-3.2-1B", metadata={"help": "Ungated copy of meta-llama/Llama-3.2-1B's tokenizer"})
+    tokenizer: str = field(default="NousResearch/Llama-3.2-1B", metadata={"help": "tokenizer.json byte-identical to the gated meta-llama/Llama-3.2-1B (unsloth/Llama-3.2-1B: same ids, other format)"})
     train_frac: float = field(default=0.05, metadata={"help": "Fraction of the shuffled train docs to tokenize (5% ~= 7.5B tokens)"})
     num_val_docs: int = field(default=10_000, metadata={"help": "First N of the 50k eval docs tokenized into val.bin (<= 20% allowed)"})
     num_proc: int = field(default=len(os.sched_getaffinity(0)))
