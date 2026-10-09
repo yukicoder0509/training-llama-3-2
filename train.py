@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, LlamaConfig, AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback
+from transformers import AutoTokenizer, LlamaConfig, AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback, set_seed
 import torch
 import numpy as np
 import math
@@ -63,6 +63,7 @@ parser.add_argument("--sophia_hess_interval", type=int, default=10, help="Re-est
 parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon: peak Muon LR (match_rms_adamw scaling; tuned on GPT-2, re-tune for Llama); --learning_rate is the AdamW part's")
 parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
 parser.add_argument("--data_dir", type=str, default=os.path.expandvars("/work/$USER/dolma3_llama"), help="Dir with train.bin and val.bin (uint32, prepare_data.py)")
+parser.add_argument("--seed", type=int, default=None, help="Seed for the init, data order and Sophia's label sampling (default: torch's fixed default RNG for the init, Trainer seed 42 for the rest; set it for repeat-seed runs)")
 parser.add_argument("--run_name", type=str, default=None, help="W&B run name; also isolates checkpoints in results/<run_name>")
 parser.add_argument("--save_dir", type=str, default=None, help="Where to save the final model + tokenizer (default: /work/$USER/llama_models/<run_name or latest>)")
 args = parser.parse_args()
@@ -190,6 +191,8 @@ config = LlamaConfig(
     attention_bias=False, attention_dropout=0.0, mlp_bias=False,
     bos_token_id=128000, eos_token_id=128001, pad_token_id=128004, use_cache=False,
 )
+if args.seed is not None:
+    set_seed(args.seed)  # the init draws from the global RNG; without --seed it is torch's fixed default seed
 model = AutoModelForCausalLM.from_config(config, attn_implementation=args.attn_implementation)
 print("Attention implementation:", model.config._attn_implementation)
 print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.3f}B")
@@ -297,6 +300,7 @@ training_args = TrainingArguments(
     lr_scheduler_kwargs={"min_lr_rate": args.min_lr_ratio} if args.lr_schedule == "cosine"
     else {"num_decay_steps": DECAY_STEPS, "decay_type": "linear"} if DECAY_STEPS else {},
     warmup_steps=WARMUP_STEPS,
+    seed=42 if args.seed is None else args.seed,  # data order (and RNG after Trainer init)
 )
 print("=== Training arguments: ", training_args)
 

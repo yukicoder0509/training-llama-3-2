@@ -344,6 +344,68 @@ Plot: `plots/lr_scan_2m.png`.
 ### Next (not launched)
 
 - Measure the noise: rerun SOAP 6e-4 and AdamW 3e-4 with another seed (2 runs). This needs a small `--seed` flag in
-  train.py first: today TrainingArguments' default seed 42 fixes both the init and the data order.
+  train.py first. (Correction: the init comes from torch's fixed default RNG seed, and TrainingArguments' seed 42
+  fixes only the data order. `--seed` now sets both; see the next entries.)
 - Rather than a longer scan at this batch: the plateau dominates any short run at 2M. A more reliable scan would use
   ~1B+ tokens or a longer warmup.
+
+## 2026-10-08 — Scan winners at a 2M batch, 1B tokens
+
+The two lowest points of the 2M LR scan, rerun at 1B tokens (476 steps; otherwise the scan's setup, 20 evals).
+
+| Run | Final eval loss (ppl) | Same optimizer at 0.5M, 1.1B tokens |
+|---|---|---|
+| SOAP 6e-4 (`64lwbqmx`, job 516348) | 4.521 (92) | 3.604 (`k6ow93ln`) |
+| Sophia 5e-5, Hessian every 2 (`6bkypk4d`, job 516356, win rate 0.18) | 4.898 (134) | 3.394 (`wq8wp81b`, k=10, LR 1e-4) |
+
+Cost: 6.4 and 8.8 GPU-h. (A first Sophia job, 516349, died at DDP init on `25a-hgpn062`: NCCL "Multiple Ranks are using
+the same GPU". The rerun excluded that node.)
+
+- **The 0.5M Sophia run (`llama-sophia-lr1e-4-1h-8gpu`) is still the best model** (3.394, on the Hub). Both 2M runs are
+  >0.9 nats behind their optimizer's 0.5M result at about the same token count.
+- SOAP 6e-4 at 1B (4.521) is no better than the batch sweep's SOAP 2M run, which used the same LR (4.226 at 1.04B, 4.202 at
+  1.10B). So SOAP 6e-4's big lead in the scan (5.69 vs ~6.2) was plateau-escape noise, as suspected.
+- At ≤1.1B tokens the problem is the step count, not the optimizer: 476–524 steps at 2M vs 2,098 at 0.5M. Second-order
+  methods narrow the gap at 2M (SOAP 4.20 vs AdamW 4.43) but don't close it.
+- For the 6B run, 0.5M gives ~11.4k steps and 2M ~2.9k. The 1B results say to keep 0.5M unless a 6B-scale test shows
+  otherwise.
+
+## 2026-10-08 — Sophia tuning at a 0.5M batch, 1.1B tokens
+
+Each run changes one setting of the best run so far (`llama-sophia-lr1e-4-1h-8gpu`, `wq8wp81b`: LR 1e-4, ρ 0.05,
+Hessian every 10 steps, wd 0.2, WSD, 2,098 steps). New `--seed` flag: sets the init (`set_seed` before the model is built),
+the data order and Sophia's sampled labels; without it, runs reproduce the old behaviour. All five completed 2,098/2,098 steps.
+
+| Run (W&B) | Change | Final eval loss (ppl) | Final win rate |
+|---|---|---|---|
+| baseline (`wq8wp81b`) | — | 3.394 (29.8) | 0.15 |
+| `s05-seed1` (`aks0lvt7`) | `--seed=1` | 3.324 (27.8) | 0.17 |
+| `s05-lr5e-5` (`omad8mgf`) | LR 5e-5 | **3.320 (27.7)** | 0.21 |
+| `s05-lr2e-4` (`g8f5wal3`) | LR 2e-4 | 4.484 (88.6) | 0.54 |
+| `s05-rho0.1` (`e2susbrf`) | ρ 0.1 | 3.321 (27.7) | 0.29 |
+| `s05-k5` (`cmb4skie`) | Hessian every 5 steps | 3.374 (29.2) | 0.18 |
+
+Jobs 516656–516660, ~7.3 GPU-h each (k=5: 8.0; lr2e-4 ran on a slower node: 8.9).
+
+- **Seed noise is ~0.07 nats** (3.394 vs 3.324 for the same settings, from one pair). LR 5e-5, ρ 0.1 and k=5 all land
+  within that of the two baseline seeds, so none is a clear win. LR 5e-5 and ρ 0.1 both shrink the step (ρ divides the
+  Hessian-scaled step) and both match the better seed, which hints that slightly smaller steps help, but it is not shown.
+- **LR 2e-4 is clearly too high** (+1.1 nats): the 1e-4–2e-4 range is a cliff, consistent with 3e-4 / 6e-4 stalling earlier.
+  So the usable LR is ≤1e-4 at this batch.
+- A Hessian every 5 steps does not help at 0.5M (+9% time), unlike every 2 steps at 2M where only ~240 steps were run.
+- Best single run: `s05-lr5e-5` (3.320), but within noise of `s05-seed1` and `s05-rho0.1`.
+
+## 2026-10-09 — Sophia LR 5e-5: second seed, and 2B tokens
+
+Same settings as `s05-lr5e-5` (LR 5e-5, ρ 0.05, Hessian every 10, wd 0.2, WSD 2% / 20%, 0.5M batch).
+
+| Run (W&B, job) | Budget | Final eval loss (ppl) |
+|---|---|---|
+| `s05-lr5e-5-seed1` (`odfrtif3`, 517026) | 1.1B, 2,098 steps, `--seed=1` | 3.323 (27.7) |
+| `s05-lr5e-5-2b` (`a9yvdpi3`, 517027) | 2B, 3,814 steps | **3.047 (21.1)** |
+
+Cost: 7.3 and 12.6 GPU-h.
+
+- Two seeds per LR at 1.1B: LR 5e-5 gives 3.320 / 3.323, LR 1e-4 gives 3.394 / 3.324. LR 5e-5 is at least as good and much
+  more consistent across seeds; keep it.
+- 2B tokens: 3.047, 0.27 nats below the 1.1B runs, the best model so far.
