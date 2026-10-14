@@ -26,7 +26,30 @@ Downloads the dataset (~110 GB, pinned revision) and writes to `$OUT_DIR` (defau
 - `eval_docs.jsonl`: all 50k held-out texts, for exact OJ-style evaluation later. Also `meta.json` with the counts.
 
 Tokens are uint32 (Llama 3 vocab 128,256), one doc = `<|begin_of_text|> text <|end_of_text|>`, packed into 8192 blocks.
-The tokenizer is `NousResearch/Llama-3.2-1B` (its `tokenizer.json` is byte-identical to the gated `meta-llama/Llama-3.2-1B`). The data is not cleaned.
+The tokenizer is `NousResearch/Llama-3.2-1B` (its `tokenizer.json` is byte-identical to the gated `meta-llama/Llama-3.2-1B`). By default the data is not cleaned.
+
+Optional cleaning (train docs only; the eval split, `val.bin` and `eval_docs.jsonl` stay byte-identical). Write each
+variant to its own `OUT_DIR` and train on it with `--data_dir`:
+
+```
+OUT_DIR=/work/$USER/dolma3_llama_dedup sbatch prepare.sbatch --dedup --min_train_tokens=7e9
+OUT_DIR=/work/$USER/dolma3_llama_qc1e-3 sbatch prepare.sbatch --qc_max=0.001 --train_frac=0.11
+```
+
+- `--dedup`: exact dedup over the whole dataset. Dolma 3 upsamples by repetition (104M docs are only 35.8M distinct
+  texts, 40% of the characters). Key per doc: `metadata.text_hash` (common_crawl), else a 64-bit blake2b of the text;
+  keys are cached in `dedup_keys.npz`. Keeps one copy per text and drops every copy of a text that also appears in the
+  eval split. The train sample is drawn uniformly over the unique texts (not a prefix of the seed-42 shuffle, which
+  would keep the upsampling: a text with k copies would land in it with probability 1 − 0.95^k).
+  - `--min_train_tokens`: with `--dedup`, take random unique texts until they hold about this many tokens (estimated
+    from a tokenized sample), instead of `--train_frac` of them.
+- `--qc_max=t`: drop train docs with `metadata.dolma2_qc["1"] >= t` (a fastText quality score). Only common_crawl docs
+  carry it; the other sources are always kept. Writes `qc_stats.json` per source dir. Which label is "good" is
+  unresolved (experiments.md 2026-10-13); pick `t` with `qc_scan.sbatch` + `plot_qc.py` (score distribution, data
+  left per threshold). `0.001` keeps 34% of the bytes (6.25B tokens at `--train_frac=0.11`).
+
+`meta.json` records the options and the dedup / qc counts. Dedup at 1B tokens: 3.371 vs 3.387, within noise
+(experiments.md 2026-10-14); the qc-filtered data has not been trained on yet.
 (`dedup_filter.py` / `dedup_filter.sbatch` are the old C4 pipelines, not yet ported.)
 
 ## 2. Train
@@ -48,7 +71,7 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--per_device_batch` | `4` | Max sequences per GPU per micro-batch; grad accum covers the rest |
 | `--batch_ramp` | none | `"B1:f1,...,Bn"`: batch Bi for fraction fi of the token budget |
 | `--learning_rate` / `--weight_decay` / `--beta2` | `6e-4` / `0.1` / `0.95` | AdamW (untuned starting points) |
-| `--warmup_frac` / `--decay_frac` | `0.02` / `0.2` | Linear warmup, then WSD with linear decay to 0 over the final fraction |
+| `--warmup_frac` / `--decay_frac` | `0.02` / `0.1` | Linear warmup, then WSD with linear decay to 0 over the final fraction (0.1 as in MiniCPM; runs before 2026-10-14 used 0.2) |
 | `--lr_schedule` / `--min_lr_ratio` | `wsd` / `0.1` | `cosine`: cosine from the peak to `min_lr_ratio` × peak (Llama 2/3) |
 | `--adam_eps` | `1e-8` | Adam ε (Llama 2: 1e-5) |
 | `--optimizer` | `adamw` | `adamw` (fused torch AdamW), `adam_mini`, `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`), `sophia` (SophiaG, `sophia.py` vendored from the official repo) or `soap` (see below); LR = `--learning_rate` |
@@ -58,7 +81,8 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--ddp_find_unused` / `--ddp_bucket_cap_mb` / `--ddp_bf16_grads` | off / `200` / off | DDP settings (+6% vs Trainer's defaults of on / 25 MB); bf16 all-reduce gives no gain with large buckets |
 | `--num_evals` | `20` | Evals over the run (lab: at least every 10% of steps) plus a final eval |
 | `--fused_ce` / `--torch_compile` | on in the sbatch scripts | Liger fused LM head + CE (no 4 GiB/seq fp32 logits); `torch.compile` per decoder layer |
-| `--attn_implementation` | `sdpa` | `sdpa`, `flash_attention_3`, `flash_attention_4` |
+| `--attn_implementation` | `flash_attention_3` | `flash_attention_3` (Hub kernel via `kernels`), `sdpa`, `flash_attention_4` |
+| `--packing` | `doc` | `doc`: each document attends only to itself, positions restart per document (FA varlen; ~10% faster). `concat`: attention crosses document boundaries (all runs before 2026-10-14). Evals use the same mode; compare across modes with `eval_packing.py` |
 | `--profile_dir` / `--profile_start` / `--profile_cpu` | off / `8` / on | torch.profiler over 5 steps |
 | `--data_dir` | `/work/$USER/dolma3_llama` | `train.bin` / `val.bin` |
 | `--save_dir` | `/work/$USER/llama_models/<run_name>` | Final model + tokenizer |

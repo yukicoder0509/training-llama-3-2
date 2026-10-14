@@ -29,17 +29,18 @@ parser.add_argument("--model_name", type=str, required=True, help="Hub repo the 
 parser.add_argument("--token_budget", type=float, default=6e9, help="Training tokens (lab cap 6B; every token of a step counts, there is no padding). Sets the step count")
 parser.add_argument("--learning_rate", type=float, default=6e-4, help="Peak LR (untuned starting point for 1B at ~0.5M-token batches)")
 parser.add_argument("--warmup_frac", type=float, default=0.02, help="Linear warmup over this fraction of the steps")
-parser.add_argument("--decay_frac", type=float, default=0.2, help="--lr_schedule wsd: 0 = constant after warmup; >0 = linear decay to 0 over this fraction of the final steps")
+parser.add_argument("--decay_frac", type=float, default=0.1, help="--lr_schedule wsd: 0 = constant after warmup; >0 = linear decay to 0 over this fraction of the final steps (default 0.1, MiniCPM WSD; ties 0.2 for Sophia at 1.1B, experiments.md 2026-10-14; runs before that used 0.2)")
 parser.add_argument("--lr_schedule", type=str, default="wsd", choices=["wsd", "cosine"], help="wsd (warmup-stable-decay, see --decay_frac) or cosine (Llama 2/3: warmup, then cosine to --min_lr_ratio x peak)")
 parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="--lr_schedule cosine: final LR / peak (Llama 2: 0.1)")
 parser.add_argument("--adam_eps", type=float, default=1e-8, help="Adam epsilon (Llama 2: 1e-5)")
 parser.add_argument("--weight_decay", type=float, default=0.1, help="AdamW weight decay (Llama 3 / GPT-3: 0.1)")
 parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for both optimizers (0.95: Llama/GPT-3; 0.999: PyTorch default)")
 parser.add_argument("--global_batch_size", type=int, default=64, help="Sequences of 8192 tokens per optimizer step (per-GPU batch x grad accum x GPUs); 64 = 0.5M tokens")
-parser.add_argument("--batch_ramp", type=str, default=None, help='Global batch-size ramp "B1:f1,B2:f2,...,Bn": batch Bi for fraction fi of the token budget, the last for the rest (e.g. "32:0.1,64"). One micro-batch of Bi/GPUs per GPU per step (no grad accum); overrides --global_batch_size / --per_device_batch')
+parser.add_argument("--batch_ramp", type=str, default=None, help='Global batch-size ramp "B1:f1,B2:f2,...,Bn": batch Bi for fraction fi of the token budget, the last for the rest (e.g. "32:0.1,64"). Grad accum is fixed (enough for the largest Bi at --per_device_batch), so the micro-batch is Bi/(GPUs x accum); overrides --global_batch_size')
 parser.add_argument("--per_device_batch", type=int, default=4, help="Max sequences per GPU per micro-batch; grad accum covers the rest")
 parser.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=False, help="Liger fused LM head + cross-entropy: never materializes the full fp32 logits (128k vocab x 8192 tokens = 4 GiB per sequence). On in run.sbatch/profile.sbatch; --no-fused_ce disables")
-parser.add_argument("--attn_implementation", type=str, default="sdpa", help="HF attention backend: sdpa (cuDNN flash), flash_attention_3 (Hub kernel kernels-community/vllm-flash-attn3 via `kernels`), flash_attention_4 (pip flash-attn-4, CuTe DSL)")
+parser.add_argument("--attn_implementation", type=str, default="flash_attention_3", help="HF attention backend (default flash_attention_3: needed by --packing doc): sdpa (cuDNN flash), flash_attention_3 (Hub kernel kernels-community/vllm-flash-attn3 via `kernels`), flash_attention_4 (pip flash-attn-4, CuTe DSL)")
+parser.add_argument("--packing", type=str, default="doc", choices=["concat", "doc"], help="Default doc (~10%% faster, experiments.md 2026-10-14). concat: documents concatenated into 8192 blocks, attention runs across document boundaries. doc: same blocks, but each document attends only to itself and RoPE positions restart at each <|begin_of_text|> (FlashAttention varlen; needs --attn_implementation flash_attention_3). Applies to the evals too")
 parser.add_argument("--max_steps", type=int, default=None, help="Override the token-budget step count (e.g. short speed tests)")
 parser.add_argument("--num_evals", type=int, default=20, help="Evals over the run (lab: at least every 10%% of the steps)")
 parser.add_argument("--torch_compile", action=argparse.BooleanOptionalAction, default=False, help="torch.compile each decoder layer (not the rotary/mask setup or the Liger loss): fuses RMSNorm/cast/SwiGLU/elementwise kernels. On in run.sbatch/profile.sbatch; --no-torch_compile disables")
@@ -67,11 +68,12 @@ parser.add_argument("--seed", type=int, default=None, help="Seed for the init, d
 parser.add_argument("--run_name", type=str, default=None, help="W&B run name; also isolates checkpoints in results/<run_name>")
 parser.add_argument("--save_dir", type=str, default=None, help="Where to save the final model + tokenizer (default: /work/$USER/llama_models/<run_name or latest>)")
 args = parser.parse_args()
+ARGS = args  # callbacks get the TrainingArguments as `args`
 MODEL_NAME = args.model_name
 DATA_DIR = os.path.expanduser(args.data_dir)
 SAVE_DIR = os.path.expanduser(args.save_dir or os.path.join(os.path.expandvars("/work/$USER/llama_models"), args.run_name or "latest"))
 
-print("Model name:", MODEL_NAME, "LR:", args.learning_rate, "Optimizer:", args.optimizer, *(["Muon LR:", args.muon_lr] if args.optimizer == "muon" else []), "WD:", args.weight_decay, "beta2:", args.beta2, "Run name:", args.run_name, "Data dir:", DATA_DIR)
+print("Model name:", MODEL_NAME, "LR:", args.learning_rate, "Optimizer:", args.optimizer, *(["Muon LR:", args.muon_lr] if args.optimizer == "muon" else []), "WD:", args.weight_decay, "beta2:", args.beta2, "Run name:", args.run_name, "Packing:", args.packing, "Data dir:", DATA_DIR)
 
 
 def slurm_time_left():
@@ -105,14 +107,18 @@ if args.batch_ramp:
     sizes = [int(st[0]) for st in stages]
     fracs = [float(st[1]) for st in stages[:-1]]
     fracs.append(1 - sum(fracs))
-    assert all(b % WORLD_SIZE == 0 for b in sizes) and fracs[-1] > 0, args.batch_ramp
+    # The Trainer's grad accum is fixed: enough micro-batches for the largest batch at --per_device_batch; smaller
+    # batches use smaller micro-batches (one static compile per size)
+    GRAD_ACCUM = -(-max(sizes) // (WORLD_SIZE * args.per_device_batch))
+    assert all(b % (WORLD_SIZE * GRAD_ACCUM) == 0 for b in sizes) and fracs[-1] > 0, args.batch_ramp
     RAMP = [(b, int(f * args.token_budget // (b * BLOCK_SIZE))) for b, f in zip(sizes, fracs)]
     if args.max_steps:  # short tests: keep the stage proportions in steps
         total = sum(n for _, n in RAMP)
         RAMP = [(b, max(1, round(n * args.max_steps / total))) for b, n in RAMP]
     MAX_STEPS = sum(n for _, n in RAMP)
-    PER_DEVICE_BATCH, GRAD_ACCUM = sizes[0] // WORLD_SIZE, 1
-    print("Batch ramp:", ", ".join(f"{b} x {n} steps" for b, n in RAMP))
+    PER_DEVICE_BATCH = sizes[0] // (WORLD_SIZE * GRAD_ACCUM)
+    print("Batch ramp:", ", ".join(f"{b} x {n} steps ({b // (WORLD_SIZE * GRAD_ACCUM)}/GPU)" for b, n in RAMP),
+          f"x grad accum {GRAD_ACCUM}")
 
 
 def batch_at(step):
@@ -138,29 +144,30 @@ def tokens_seen(step):
 
 
 class RampBatchSampler:
-    """Index batches for --batch_ramp: per optimizer step, one batch of B/GPUs indices per rank, in rank order
-    (accelerate's BatchSamplerShard hands batch k to rank k % GPUs; no fixed batch_size attribute, so it accepts
+    """Index batches for --batch_ramp: per optimizer step, `accum` micro-batches of B/(GPUs x accum) indices per rank,
+    in rank order (accelerate's BatchSamplerShard hands batch k to rank k % GPUs; no fixed batch_size attribute, so it accepts
     varying sizes). Random order without replacement, seeded; after the schedule it keeps the last size until the
     data runs out (the Trainer stops at max_steps)."""
 
-    def __init__(self, num_samples, ramp, world_size, seed):
-        self.n, self.ramp, self.world, self.seed = num_samples, ramp, world_size, seed
+    def __init__(self, num_samples, ramp, world_size, seed, accum=1):
+        self.n, self.ramp, self.world, self.seed, self.accum = num_samples, ramp, world_size, seed, accum
         used = sum(b * k for b, k in ramp)
         assert used <= num_samples, f"ramp needs {used:,} sequences, dataset has {num_samples:,}"
         self.tail_steps = (num_samples - used) // ramp[-1][0]
 
     def __len__(self):
-        return self.world * (sum(k for _, k in self.ramp) + self.tail_steps)
+        return self.world * self.accum * (sum(k for _, k in self.ramp) + self.tail_steps)
 
     def __iter__(self):
         perm = torch.randperm(self.n, generator=torch.Generator().manual_seed(self.seed)).tolist()
         sizes = [b for b, k in self.ramp for _ in range(k)] + [self.ramp[-1][0]] * self.tail_steps
         pos = 0
         for b in sizes:
-            m = b // self.world
-            for r in range(self.world):
-                yield perm[pos + r * m : pos + (r + 1) * m]
-            pos += b
+            m = b // (self.world * self.accum)
+            for _ in range(self.accum):
+                for r in range(self.world):
+                    yield perm[pos : pos + m]
+                    pos += m
 
 
 EVAL_STEPS = max(1, MAX_STEPS // args.num_evals)
@@ -193,6 +200,7 @@ config = LlamaConfig(
 )
 if args.seed is not None:
     set_seed(args.seed)  # the init draws from the global RNG; without --seed it is torch's fixed default seed
+assert args.packing == "concat" or args.attn_implementation.startswith("flash_attention"), "--packing doc needs FlashAttention varlen (--attn_implementation flash_attention_3)"
 model = AutoModelForCausalLM.from_config(config, attn_implementation=args.attn_implementation)
 print("Attention implementation:", model.config._attn_implementation)
 print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e9:.3f}B")
@@ -207,6 +215,8 @@ if args.fused_ce:
     fused_ce = {r: LigerFusedLinearCrossEntropyLoss(reduction=r) for r in ("mean", "sum")}
 
     def fused_ce_forward(input_ids=None, labels=None, num_items_in_batch=None, sample_labels=False, **kwargs):
+        if "cu_seq_lens_q" in kwargs:  # --packing doc: the document count varies per batch; one dynamic-shape compile, not one per count
+            torch._dynamo.maybe_mark_dynamic(kwargs["cu_seq_lens_q"], 0)
         hidden = model.model(input_ids=input_ids, **kwargs).last_hidden_state
         if sample_labels:  # Sophia's Hessian estimate: mean CE against labels drawn from the model's own predictions
             return CausalLMOutputWithPast(loss=sampled_label_loss(hidden))
@@ -239,6 +249,14 @@ if args.fused_ce:
 if args.torch_compile:
     if args.batch_ramp:  # a static recompile per batch size, not slower dynamic-shape kernels after the first change
         torch._dynamo.config.automatic_dynamic_shapes = False
+    if args.attn_implementation.startswith("flash_attention"):
+        # The FlashAttention Hub kernel is not traceable (graph break at the call), and the frame resumed after it would
+        # recompile per layer_idx (static int attribute) and fall back to eager past the recompile limit (8): make
+        # it dynamic. Also skip HF's warning_once that it casts autocast's fp32 q/k/v to bf16 (another graph break).
+        import logging
+        torch._dynamo.config.ignore_logging_functions.add(logging.Logger.warning_once)
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        torch._dynamo.config.recompile_limit = 32
     for layer in model.model.layers:
         layer.compile()
 
@@ -255,6 +273,23 @@ class TokenBlocks(Dataset):
     def __getitem__(self, i):
         x = torch.from_numpy(self.tokens[i * self.block_size : (i + 1) * self.block_size].astype(np.int64))
         return {"input_ids": x, "labels": x}  # model shifts labels internally
+
+# --packing doc: each block is split at its <|begin_of_text|> tokens (the block's first segment may be the tail of a
+# document cut by the previous block). position_ids restart at 0 per segment (RoPE), and cu_seq_lens (segment starts in
+# the micro-batch flattened to one sequence, plus the end) make HF's FlashAttention call the varlen kernel, so attention
+# stays inside each document. max_length is the 8192 upper bound (a Python int: no per-batch recompile / host sync).
+# Labels are unchanged (an <|end_of_text|> still predicts the next <|begin_of_text|>), so the loss counts the same tokens.
+BOS_ID = config.bos_token_id
+
+def doc_packing_collate(features):
+    ids = torch.stack([f["input_ids"] for f in features])
+    starts = ids == BOS_ID
+    starts[:, 0] = True
+    first = torch.where(starts, torch.arange(ids.size(1)), 0).cummax(1).values  # index of the segment's first token
+    flat_starts = starts.reshape(-1).nonzero().view(-1)
+    cu = torch.cat([flat_starts, torch.tensor([ids.numel()])]).to(torch.int32)
+    return {"input_ids": ids, "labels": ids.clone(), "position_ids": torch.arange(ids.size(1)) - first,
+            "cu_seq_lens_q": cu, "cu_seq_lens_k": cu, "max_length_q": BLOCK_SIZE, "max_length_k": BLOCK_SIZE}
 
 train_ds = TokenBlocks(os.path.join(DATA_DIR, "train.bin"), BLOCK_SIZE)
 val_ds = TokenBlocks(os.path.join(DATA_DIR, "val.bin"), BLOCK_SIZE)
@@ -347,6 +382,14 @@ class WandbTokenAxisCallback(TrainerCallback):
         import wandb
         if state.is_world_process_zero and wandb.run is not None:
             wandb.define_metric("train/total_tokens_seen")
+            # WandbCallback logs TrainingArguments and the model config; add every train.py flag (W&B config "args.*")
+            # and the derived run shape ("derived.*"), so runs can be filtered / compared by them
+            wandb.config.update({"args": vars(ARGS), "derived": {
+                "max_steps": MAX_STEPS, "warmup_steps": WARMUP_STEPS, "decay_steps": DECAY_STEPS, "eval_steps": EVAL_STEPS,
+                "tokens": tokens_seen(MAX_STEPS), "tokens_per_step": None if RAMP else batch_at(1) * BLOCK_SIZE,
+                "batch_ramp_steps": RAMP, "world_size": WORLD_SIZE, "per_device_batch": PER_DEVICE_BATCH, "grad_accum": GRAD_ACCUM,
+                "block_size": BLOCK_SIZE, "slurm_job_id": os.environ.get("SLURM_JOB_ID"), "node": os.environ.get("SLURMD_NODENAME")}},
+                allow_val_change=True)
             for key in TOKEN_AXIS_METRICS:  # explicit names take precedence over WandbCallback's "*" -> global_step
                 wandb.define_metric(key, step_metric="train/total_tokens_seen")
 
@@ -413,13 +456,17 @@ elif args.optimizer == "muon":
 
 elif args.optimizer == "sophia":
     assert args.fused_ce, "--optimizer sophia samples labels inside the fused CE forward; use --fused_ce"
-    assert RAMP is None, "--optimizer sophia: bs (tokens per step) is fixed; no --batch_ramp"
-    SOPHIA_BS = args.global_batch_size * BLOCK_SIZE  # official: step(bs=total_bs * block_size), tokens per step
+
+    def sophia_bs(step):  # official: step(bs=total_bs * block_size), tokens per step; follows --batch_ramp
+        return batch_at(step) * BLOCK_SIZE
 
     class SophiaGTrainer(SophiaG):
         """The HF Trainer calls optimizer.step() without SophiaG's bs argument."""
+        t = 0  # optimizer steps taken (1-based step of this call)
+
         def step(self, closure=None, bs=None):
-            return super().step(closure, bs=SOPHIA_BS)
+            self.t += 1
+            return super().step(closure, bs=sophia_bs(self.t))
 
     # Same decay split as the HF Trainer's AdamW (matrices + embedding; not the RMSNorm weights)
     params = [p for p in model.parameters() if p.requires_grad]
@@ -430,7 +477,7 @@ elif args.optimizer == "sophia":
         weight_decay=args.weight_decay,
     )
     print(f"SophiaG: lr {args.learning_rate}, rho {args.sophia_rho}, betas {args.sophia_betas}, wd {args.weight_decay}, "
-          f"bs {SOPHIA_BS:,} tokens, Hessian every {args.sophia_hess_interval} steps")
+          f"bs {sophia_bs(1):,}{f' -> {sophia_bs(MAX_STEPS):,}' if RAMP else ''} tokens, Hessian every {args.sophia_hess_interval} steps")
 
 elif args.optimizer == "soap" and args.soap_impl == "meta":
     import distributed_shampoo as ds
@@ -483,13 +530,13 @@ class SophiaHessianCallback(TrainerCallback):
         for i, inputs in enumerate(batches):
             sync = contextlib.nullcontext() if i == len(batches) - 1 or ddp_model is model else ddp_model.no_sync()
             with sync, trainer.compute_loss_context_manager():
-                loss = ddp_model(input_ids=inputs["input_ids"], sample_labels=True).loss / len(batches)
+                loss = ddp_model(**{k: v for k, v in inputs.items() if k != "labels"}, sample_labels=True).loss / len(batches)
                 loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args_.max_grad_norm)
         optimizer.update_hessian()
         optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
-            unclipped = sum((st["exp_avg"].abs() < args.sophia_rho * SOPHIA_BS * st["hessian"]).sum()
+            unclipped = sum((st["exp_avg"].abs() < args.sophia_rho * sophia_bs(state.global_step) * st["hessian"]).sum()
                             for st in optimizer.state.values())
             sophia_stats["sophia_win_rate"] = (unclipped / sum(st["exp_avg"].numel() for st in optimizer.state.values())).item()
 
@@ -569,7 +616,7 @@ class CustomTrainer(Trainer):
     def get_train_dataloader(self):
         if RAMP is None:
             return super().get_train_dataloader()
-        sampler = RampBatchSampler(len(self.train_dataset), RAMP, WORLD_SIZE, self.args.seed)
+        sampler = RampBatchSampler(len(self.train_dataset), RAMP, WORLD_SIZE, self.args.seed, GRAD_ACCUM)
         return self.accelerator.prepare(DataLoader(self.train_dataset, batch_sampler=sampler,
                                                    collate_fn=self.data_collator, pin_memory=True))
 
@@ -597,6 +644,7 @@ trainer = CustomTrainer(
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=val_ds,
+    data_collator=doc_packing_collate if args.packing == "doc" else None,
     # Sophia's Hessian pass before step_timer, so its time counts in tokens_per_second / MFU
     callbacks=([SophiaHessianCallback()] if args.optimizer == "sophia" else [])
     + [DeadlineCallback(deadline), step_timer, WandbTokenAxisCallback()]

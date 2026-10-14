@@ -409,3 +409,166 @@ Cost: 7.3 and 12.6 GPU-h.
 - Two seeds per LR at 1.1B: LR 5e-5 gives 3.320 / 3.323, LR 1e-4 gives 3.394 / 3.324. LR 5e-5 is at least as good and much
   more consistent across seeds; keep it.
 - 2B tokens: 3.047, 0.27 nats below the 1.1B runs, the best model so far.
+
+## 2026-10-09 — Sophia LR 5e-5 at 3B tokens: below the ppl-20 baseline
+
+Same settings as `s05-lr5e-5-2b`, budget 3B tokens (5,722 steps). Job 519268, W&B `s05-lr5e-5-3b` (`2yvqk5x7`),
+2 h 19 min, 18.5 GPU-h, `budget_completed` true.
+
+| Tokens | Final eval loss (ppl) |
+|---|---|
+| 1.1B | 3.320 (27.7) |
+| 2B | 3.047 (21.1) |
+| 3B | **2.897 (18.1)** |
+
+- Beats the ppl-20 baseline (loss ≤ 2.996) by 0.10 nats, more than the ~0.07 seed noise.
+- Gain per added token is shrinking (1.1B→2B: −0.27; 2B→3B: −0.15), as expected. The 6B budget is still unused.
+
+## 2026-10-13 — dolma2_qc distribution and a "1" < 0.001 filter
+
+`dolma2_qc` = fastText {"0", "1"} probabilities, on common_crawl docs only (~121B of ~157B tokens; wiki, arXiv,
+stack_edu, finemath and olmocr PDFs have no score). Scan: `qc_scan.sbatch` (every 10th shard per directory, 11.6M CC
+docs), plot: `plot_qc.py` → `plots/dolma2_qc.png`. Weights are per directory: each topic is split into `-00NN` bucket
+directories ~1000x apart in size, and the first scan (weights per topic) over-counted the small buckets (it predicted
+29% of CC docs below 0.001; the full count is 17.6%; the per-directory scan gives 17.7%).
+
+- Very skewed: half the CC docs have "1" < 0.012, 75% < 0.085, 5% ≥ 0.99.
+- **The `-00NN` buckets are bins of this score**: buckets ≤0015 are 100% below 0.001, 0018 has median 0.0025,
+  0019 median 0.052 and 0% below 0.001. 0019 is the largest (~half the sampled CC docs), i.e. the mix draws most from
+  the high-"1" end, which suggests AI2 treat high "1" as high quality. Against that: the ≥0.99 docs are 25% short
+  (<500 chars) and 12% adult content, vs 2% / 0.2% below 0.001, and spot checks look like ads / SEO. Unresolved.
+- Filter `prepare_data.py --qc_max=0.001 --train_frac=0.11` (job 536445, 19 min) → `/work/$USER/dolma3_llama_qc1e-3`:
+  over the whole dataset it keeps 34.4M / 104.0M docs, 34.2% of bytes (CC: 17.6% of docs; unscored sources: all).
+  `train.bin` = 6.25B tokens (just above the 6B budget). The mix shifts from CC 79% of bytes to 40%: olmocr PDFs 33%,
+  stack_edu 19%, finemath 6%. `val.bin` and `eval_docs.jsonl` are byte-identical to the unfiltered ones.
+
+## 2026-10-14 — Exact dedup by text_hash, 1B-token comparison
+
+`prepare_data.py --dedup --min_train_tokens=7e9` (jobs 537088 keys + 537294, ~50 min, 12 CPUs) →
+`/work/$USER/dolma3_llama_dedup`. Key per doc: `metadata.text_hash` (128-bit, CC only, truncated to 64 bits), else a
+64-bit blake2b of the text. Same-hash texts checked identical on one shard; copies share `id` and URL.
+
+- Whole dataset: 104.0M docs → **35.8M distinct texts (34%), 40% of the characters** (~63B unique train tokens).
+  One text has 189,538 copies. In a top-bucket shard (`common_crawl-health-0019`) 56,908 docs are 8,186 texts:
+  Dolma 3 upsamples by repetition.
+- 365k train docs share their text with an eval doc; all their copies are dropped (eval files untouched; `val.bin`
+  byte-identical).
+- First version took a prefix of the seed-42 shuffle after keeping each text's first copy. That sample was 92% of the
+  original `train.bin`: a text with k copies lands in a 5% prefix with probability 1 − 0.95^k, so the upsampling
+  survives. Fixed: train docs are drawn uniformly over the unique texts (new permutation, seed 43).
+  `train.bin` = 4.07M docs, 7.18B tokens.
+
+1B tokens (1,907 steps), Sophia LR 5e-5, ρ 0.05, k 10, wd 0.2, WSD 2% / 20%, 0.5M batch:
+
+| Data | Run (W&B, job) | Final eval loss (ppl) |
+|---|---|---|
+| original | `orig-sophia-lr5e-5-1b` (`3py1n6n3`, 537138) | 3.387 (29.6) |
+| dedup | `dedup-sophia-lr5e-5-1b` (`e9g8u50v`, 537295) | **3.371 (29.1)** |
+
+- −0.016 nats, well inside the ~0.07 seed noise: no measurable effect at 1B. Expected to be small here: at ≤6B tokens
+  from a 7B sample neither run repeats much; the difference is mainly the mix (dedup drops AI2's quality upsampling
+  and decontaminates vs eval). Dedup is at least not worse even though the upsampled top-bucket texts lose weight.
+
+## 2026-10-14 — Data scaling (MiniCPM "Data Scaling with WSD"): Sophia vs AdamW, 0.5–3B tokens
+
+One full WSD run per budget (not decays branched from one run), original data, 0.5M batch, 8 H200. Sophia LR 5e-5,
+ρ 0.05, k 10, wd 0.2; AdamW LR 3e-4, ε 1e-5, β2 0.95, wd 0.1 (= `llama-wsd-1h-8gpu`). WSD 2% / 20%. Fit:
+`fit_scaling.py` → `plots/data_scaling.png` (grid over α / τ, least squares for L∞, A).
+
+| Tokens | Sophia (W&B) | AdamW (W&B) | Gap |
+|---|---|---|---|
+| 0.5B | 4.021 (`x5f6h6uw`) | 4.256 (`mm5s28r5`) | 0.235 |
+| 1.0B | 3.387 (`3py1n6n3`) | 3.730 (`tz5xr7v5`) | 0.343 |
+| 1.1B | 3.320 / 3.323 (`omad8mgf`, `odfrtif3`) | 3.637 (`dkyqsbe6`) | 0.316 |
+| 1.5B | 3.176 (`z3jp88ke`) | 3.497 (`3o529zb2`) | 0.321 |
+| 2.0B | 3.047 (`a9yvdpi3`) | 3.354 (`vm0ylqxu`) | 0.307 |
+| 3.0B | 2.897 (`2yvqk5x7`) | – | |
+
+| Fit | L∞ | Exponent | RMSE | 3B | 6B (ppl) |
+|---|---|---|---|---|---|
+| Sophia, power L∞ + A·D^−α | 2.58 | α 0.83 | 0.009 | 2.907 | **2.766 (15.9)** |
+| Sophia, exp L∞ + A·e^(−D/τ) | 2.91 | τ 0.63B | 0.027 | 2.932 | 2.911 (18.4) |
+| Sophia, power, fit on ≤2B only | | | | 2.937 (actual 2.897) | 2.817 (16.7) |
+| Sophia, exp, fit on ≤2B only | | | | 3.011 (actual 2.897) | 3.002 (20.1) |
+| AdamW, power | 2.65 | α 0.59 | 0.012 | 3.205 | 3.017 (20.4) |
+| AdamW, exp | 3.27 | τ 0.65B | 0.014 | 3.286 | 3.266 (26.2) |
+
+- The power law fits; the exponential does not: it flattens by ~2.5B, and the hold-out shows it (predicts 3.011 for 3B,
+  actual 2.897). The ≤2B power law is 0.04 high at 3B, so read the power-law 6B numbers as conservative-ish.
+- The Sophia lead over AdamW is ~0.31–0.34 nats from 1B to 2B and shrinks only slowly; the power-law fits still have
+  a 0.25 gap at 6B (2.77 vs 3.02). Caveat: AdamW has no 3B point, and Sophia's LR / ρ were tuned at 1.1B while AdamW's
+  3e-4 has never been tuned at a 0.5M batch (only 3e-4 was run there), so part of the gap may be AdamW tuning. Both L∞ fits (~2.6) are poorly constrained by 0.5–3B data.
+
+## 2026-10-14 — Batch ramp: half batch for the first half of the steps (Sophia, 1.1B tokens)
+
+`--batch_ramp=32:0.3333,64`: 1,398 steps at 32 × 8192 (0.26M tokens), then 1,398 at 64 (1/3 / 2/3 of the tokens),
+2,796 steps vs 2,098 at a fixed 64. Same Sophia settings as above (LR 5e-5, ρ 0.05, k 10, wd 0.2, WSD 2% / 20% of
+all steps). Two `train.py` fixes for this: Sophia's `bs` (tokens per step, in its update clip) now follows the ramp,
+and the ramp keeps grad accumulation fixed (2) and varies the micro-batch (2 → 4 per GPU); before, it had no
+accumulation and 8 seqs/GPU went OOM (139.8 GiB; now 69 GiB).
+
+| Run (W&B, job) | Steps | Final eval loss (ppl) | Time |
+|---|---|---|---|
+| `s05-lr5e-5` / `-seed1` (`omad8mgf` / `odfrtif3`) | 2,098 | 3.320 / 3.323 (27.7) | |
+| `ramp-s05-lr5e-5-1.1b` (`1v6ed1yd`, 540186) | 2,796 | **3.270 (26.3)** | 58.5 min (job) |
+
+- −0.05 nats, against 0.003 between the two fixed-batch seeds. Ahead before the decay too: 3.592 at 0.58B tokens vs
+  3.634 at 0.71B for the fixed batch. One seed; can't separate "smaller early batch" from "33% more steps / LR updates".
+- Cost: the half-batch stage runs below full throughput (smaller micro-batch), the job took 58.5 min vs ~50.
+
+At 3B tokens (`--token_budget=3e9`, same ramp: 3,814 + 3,814 = 7,628 steps vs 5,722 fixed):
+
+| Run (W&B, job) | Steps | Final eval loss (ppl) | Job time |
+|---|---|---|---|
+| `s05-lr5e-5-3b` (`2yvqk5x7`, 519268) | 5,722 | 2.897 (18.1) | 2:18:54 |
+| `ramp-s05-lr5e-5-3b` (`um7ivu4h`, 540798) | 7,628 | **2.870 (17.6)** | 2:25:40 |
+
+- −0.027 nats, about half the 1.1B gain (−0.05): the ramp still helps at 3B but by less, consistent with the gain
+  coming mostly from extra early steps, which matter less as the run gets longer. +5% wall time.
+
+## 2026-10-14 — Document-masked packing (`--packing doc`), 1B tokens
+
+Same 8192 blocks and tokens as before, but each document attends only to itself and RoPE positions restart at each
+`<|begin_of_text|>` (FlashAttention 3 varlen via HF `cu_seq_lens`; `--attn_implementation flash_attention_3`). Labels
+unchanged. Checks: `test_packing.py` (packed forward = per-document forwards, max token-loss diff 0.02 in bf16; concat
+differs by up to 4.2). Compile fix for FA3: HF's `warning_once` and the untraceable Hub kernel break each layer's graph,
+and the resumed frame recompiled per `layer_idx` until the limit (8), leaving layers 8–15 eager; now
+`allow_unspec_int_on_nn_module` + `ignore_logging_functions` (also affects the old FA3 speed numbers).
+
+Speed, 2 GPUs, Sophia (Hessian every 5), median step: sdpa concat 4.80 s, FA3 concat 4.70 s, **FA3 doc 4.26 s (−11%)**;
+peak 74 GiB. Full 1B jobs: 46.7 vs 50.9 min.
+
+1B tokens, Sophia LR 5e-5, ρ 0.05, wd 0.2, WSD 2% / 20%, original data. `eval_packing.py` scores both saved models
+on the same `val.bin` under both protocols:
+
+| Model (W&B) | Eval concat | Eval doc |
+|---|---|---|
+| `orig-sophia-lr5e-5-1b` (`3py1n6n3`), trained concat | **3.387** | 3.408 |
+| `docpack-sophia-lr5e-5-1b` (`t93qlrhd`), trained doc | 3.417 | **3.368** |
+
+- Each model is best under its own protocol. Like for like: doc-trained is −0.040 under doc eval, +0.030 under concat
+  eval. Own-protocol (what each run's W&B eval shows): 3.368 vs 3.387.
+- Which number counts depends on how the OJ scores the 50k eval docs: one document per sequence (BOS-prefixed, as
+  `prepare_data.py` assumes) is the doc protocol, where packing wins; packed with cross-document context is concat.
+
+## 2026-10-14 — Sophia weight decay and WSD decay fraction (1.1B tokens, 0.5M batch)
+
+Sophia LR 5e-5, ρ 0.05, k 10, warmup 2%, fixed 0.5M batch, 2,098 steps, `--packing concat` (code before the doc
+default). One change per run from the baseline (wd 0.2, decay 20%, seeds 3.320 / 3.323). Runs log all flags to W&B
+(`args.*`, `derived.*`) from here on.
+
+| Run (W&B) | Weight decay | Decay fraction | Final eval loss | vs baseline mean 3.3215 |
+|---|---|---|---|---|
+| `s05-lr5e-5-wd0.1` (`mu9kf2gs`) | 0.1 | 0.2 | 3.333 | +0.012 |
+| `s05-lr5e-5` / `-seed1` | 0.2 | 0.2 | 3.320 / 3.323 | — |
+| `s05-lr5e-5-wd0.4` (`tdmklec7`) | 0.4 | 0.2 | 3.326 | +0.005 |
+| `s05-lr5e-5-decay0.1` (`i4uyuv7l`) | 0.2 | **0.1** | **3.318** | −0.003 |
+| `s05-lr5e-5-decay0.3` (`gy1wds72`) | 0.2 | 0.3 | 3.344 | +0.023 |
+| `s05-lr5e-5-decay0.4` (`gzim3p9b`) | 0.2 | 0.4 | 3.359 | +0.038 |
+
+- Weight decay is flat over 0.1–0.4 (within 0.012; 0.2 best). The AdamW-experience prior (wd 0.1 better) does not
+  carry over to Sophia here; Sophia's official 2x-AdamW value holds.
+- Decay fraction: monotone, shorter is better at this length: 10% ties 20% (−0.003, inside the seed spread), 30% and
+  40% are clearly worse. Before the decay the longer-decay runs are ahead (decay0.4 3.464 vs 3.494 at 0.87B), but
+  they spend fewer steps at the peak LR and end higher. Keep 20% (or 10%); not worth a combined wd0.1 + decay0.1 run.
+- `--decay_frac` default changed to 0.1 (MiniCPM WSD value; not worse than 0.2 here). Earlier runs passed or defaulted to 0.2.
