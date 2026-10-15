@@ -14,6 +14,7 @@
 # steps 9-13 (train.py --profile_dir) and nvidia-smi samples GPU utilization every second.
 # To profile inside a real full run instead: sbatch run.sbatch --profile_dir=logs/profile-<name> --profile_start=300
 # Extra args go to train.py, e.g. --per_device_batch=8 to test memory / speed per micro-batch size.
+# Fixed batch 64 (no default --batch_ramp, whose switch would land inside the profiled steps); later args override.
 # Output: logs/profile-<job id>/ (trace_rank*.json for chrome://tracing or ui.perfetto.dev, gpu_util.txt)
 
 cd $SLURM_SUBMIT_DIR
@@ -40,7 +41,7 @@ $NUMA_PREFIX accelerate launch \
     --num_processes=$NUM_GPUS \
     --mixed_precision=bf16 \
     --main_process_port=$((29500 + SLURM_JOB_ID % 1000)) \
-    train.py --model_name=$MODEL_NAME --max_steps=20 --no-eval --profile_dir=$OUT --fused_ce --torch_compile \
+    train.py --model_name=$MODEL_NAME --max_steps=20 --global_batch_size=64 --no-eval --profile_dir=$OUT --fused_ce --torch_compile \
     --save_dir=/tmp/profile-$SLURM_JOB_ID --run_name=profile-$SLURM_JOB_ID "$@"
 
 kill $DMON_PID

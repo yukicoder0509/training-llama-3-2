@@ -26,7 +26,7 @@ TOKENIZER = "NousResearch/Llama-3.2-1B"  # tokenizer.json byte-identical to meta
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name", type=str, required=True, help="Hub repo the saved model is meant for (pushed separately with push_model.py)")
 parser.add_argument("--token_budget", type=float, default=6e9, help="Training tokens (lab cap 6B; every token of a step counts, there is no padding). Sets the step count")
-parser.add_argument("--learning_rate", type=float, default=6e-4, help="Peak LR (untuned starting point for 1B at ~0.5M-token batches)")
+parser.add_argument("--learning_rate", type=float, default=None, help="Peak LR; with muon / muonium the AdamW (embedding, norms) LR. Default: 3e-3 for muonium (best run), 6e-4 otherwise (untuned starting point for 1B at ~0.5M-token batches)")
 parser.add_argument("--warmup_frac", type=float, default=0.02, help="Linear warmup over this fraction of the steps")
 parser.add_argument("--decay_frac", type=float, default=0.1, help="--lr_schedule wsd: 0 = constant after warmup; >0 = linear decay to 0 over this fraction of the final steps (default 0.1, MiniCPM WSD; ties 0.2 for Sophia at 1.1B, experiments.md 2026-10-14; runs before that used 0.2)")
 parser.add_argument("--lr_schedule", type=str, default="wsd", choices=["wsd", "wsd2", "cosine"], help="wsd (warmup-stable-decay, see --decay_frac), wsd2 (warmup, stable, linear decay to --stable2_lr_ratio over --decay1_frac, stable2 at that LR for --stable2_frac, then linear decay to 0 over --decay_frac) or cosine (Llama 2/3: warmup, then cosine to --min_lr_ratio x peak)")
@@ -39,8 +39,8 @@ parser.add_argument("--weight_decay", type=float, default=0.1, help="AdamW weigh
 parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for both optimizers (0.95: Llama/GPT-3; 0.999: PyTorch default)")
 parser.add_argument("--block_size", type=int, default=8192, help="Context window / training block (8192 = DESCRIPTION.md; train_scorer.py: 2048)")
 parser.add_argument("--config_overrides", type=str, default=None, help='JSON dict applied to the Llama 3.2 1B config with config.update, e.g. a smaller model (train_scorer.py)')
-parser.add_argument("--global_batch_size", type=int, default=64, help="Sequences of 8192 tokens per optimizer step (per-GPU batch x grad accum x GPUs); 64 = 0.5M tokens")
-parser.add_argument("--batch_ramp", type=str, default=None, help='Global batch-size ramp "B1:t1,B2:t2,...,Bn": batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count ("32:1e9,64", or with a K/M/B suffix: "32:1B,64"), ti <= 1 a fraction of the token budget ("32:0.1,64"). Grad accum is fixed (enough for the largest Bi at --per_device_batch), so the micro-batch is Bi/(GPUs x accum); overrides --global_batch_size')
+parser.add_argument("--global_batch_size", type=int, default=None, help="Sequences of 8192 tokens per optimizer step (per-GPU batch x grad accum x GPUs); 64 = 0.5M tokens. Default 64; giving it turns off the default --batch_ramp")
+parser.add_argument("--batch_ramp", type=str, default=None, help='Default "32:0.3333,64" (best run) unless --global_batch_size is given; "none" for a fixed batch. Global batch-size ramp "B1:t1,B2:t2,...,Bn": batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count ("32:1e9,64", or with a K/M/B suffix: "32:1B,64"), ti <= 1 a fraction of the token budget ("32:0.1,64"). Grad accum is fixed (enough for the largest Bi at --per_device_batch), so the micro-batch is Bi/(GPUs x accum); overrides --global_batch_size')
 parser.add_argument("--per_device_batch", type=int, default=4, help="Max sequences per GPU per micro-batch; grad accum covers the rest")
 parser.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=False, help="Liger fused LM head + cross-entropy: never materializes the full fp32 logits (128k vocab x 8192 tokens = 4 GiB per sequence). On in run.sbatch/profile.sbatch; --no-fused_ce disables")
 parser.add_argument("--attn_implementation", type=str, default="flash_attention_3", help="HF attention backend (default flash_attention_3: needed by --packing doc): sdpa (cuDNN flash), flash_attention_3 (Hub kernel kernels-community/vllm-flash-attn3 via `kernels`), flash_attention_4 (pip flash-attn-4, CuTe DSL)")
@@ -55,7 +55,7 @@ parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=Tru
 parser.add_argument("--ddp_find_unused", action=argparse.BooleanOptionalAction, default=False, help="DDP find_unused_parameters. Trainer would set True (no gradient checkpointing), but Llama has no unused params; off is ~1%% faster (experiments.md)")
 parser.add_argument("--ddp_bf16_grads", action=argparse.BooleanOptionalAction, default=False, help="All-reduce gradients in bf16 (DDP bf16_compress_hook): half the NCCL traffic, grads stay fp32 locally. No gain with 200 MB buckets")
 parser.add_argument("--ddp_bucket_cap_mb", type=int, default=200, help="DDP gradient bucket size; 200 MB vs torch's 25 MB: ~5%% faster on 8 GPUs and ~10 GiB less memory (experiments.md)")
-parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon", "muonium", "sophia", "soap"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini), muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py), muonium (pip muonium: Muon for the decoder-layer matrices + its fused AdamW for embedding / norms, one LR = --learning_rate, wd = --weight_decay, package defaults for the rest), sophia (SophiaG, official sophia.py) or soap (official soap.py, work split across GPUs by soap_dist.py); lr = --learning_rate for sophia and soap")
+parser.add_argument("--optimizer", type=str, default="muonium", choices=["adamw", "adam_mini", "muon", "muonium", "sophia", "soap"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini), muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py), muonium (pip muonium: Muon for the decoder-layer matrices + its fused AdamW for embedding / norms, one LR = --learning_rate, wd = --weight_decay, package defaults for the rest), sophia (SophiaG, official sophia.py) or soap (official soap.py, work split across GPUs by soap_dist.py); lr = --learning_rate for sophia and soap")
 parser.add_argument("--soap_betas", type=str, default="0.95,0.95", help="SOAP beta1,beta2 (official defaults; beta2 also drives the preconditioner EMA). Epsilon: --adam_eps")
 parser.add_argument("--soap_precond_freq", type=int, default=10, help="SOAP: re-estimate the preconditioner eigenbases every k steps (official default 10)")
 parser.add_argument("--soap_impl", type=str, default="official", choices=["official", "meta"], help="official: soap.py (paper authors) split across GPUs by soap_dist.py. meta: facebookresearch distributed_shampoo with DefaultSOAPConfig (ZeRO-1 over DDP ranks, one AllGather of the updates, blocked preconditioners)")
@@ -65,8 +65,8 @@ parser.add_argument("--soap_max_precond_dim", type=int, default=10000, help="SOA
 parser.add_argument("--sophia_rho", type=float, default=0.05, help="SophiaG rho (clip threshold; official GPT-2 125M/770M: 0.05). Tune so train/sophia_win_rate stays in 0.1-0.5")
 parser.add_argument("--sophia_betas", type=str, default="0.965,0.99", help="SophiaG beta1,beta2 (official defaults)")
 parser.add_argument("--sophia_hess_interval", type=int, default=10, help="Re-estimate the diagonal Hessian (Gauss-Newton-Bartlett) every k steps (official: 10); one extra forward + backward of the full batch, i.e. ~1/k extra compute (official: same)")
-parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon / muonium: peak Muon LR (muon: match_rms_adamw scaling, tuned on GPT-2; muonium: x sqrt(max(1, rows/cols)), Keller Jordan's scale ~0.02); --learning_rate is the AdamW / Sophia part's")
-parser.add_argument("--muonium_algorithm", type=str, default="muon", choices=["muon", "normuon"], help="--optimizer muonium: update rule for the matrices (muon, or normuon: per-neuron second-moment normalization, muon_beta2 0.95)")
+parser.add_argument("--muon_lr", type=float, default=None, help="--optimizer muon / muonium: peak Muon LR, default 0.01 for muonium (best run), 1.25e-3 for muon (muon: match_rms_adamw scaling, tuned on GPT-2; muonium: x sqrt(max(1, rows/cols)), Keller Jordan's scale ~0.02); --learning_rate is the AdamW / Sophia part's")
+parser.add_argument("--muonium_algorithm", type=str, default="normuon", choices=["muon", "normuon"], help="--optimizer muonium: update rule for the matrices (muon, or normuon: per-neuron second-moment normalization, muon_beta2 0.95)")
 parser.add_argument("--muonium_rest", type=str, default="adamw", choices=["adamw", "sophia"], help="--optimizer muonium: optimizer for the non-matrix params (tied embedding, norms) at --learning_rate / --weight_decay: muonium's AdamW, or SophiaG (--sophia_* flags, Hessian pass as in --optimizer sophia)")
 parser.add_argument("--muon_wd", type=float, default=None, help="--optimizer muonium: weight decay of the Muon matrices (default: --weight_decay)")
 parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
@@ -75,13 +75,26 @@ parser.add_argument("--seed", type=int, default=None, help="Seed for the init, d
 parser.add_argument("--run_name", type=str, default=None, help="W&B run name; also isolates checkpoints in results/<run_name>")
 parser.add_argument("--save_dir", type=str, default=None, help="Where to save the final model + tokenizer (default: /work/$USER/llama_models/<run_name or latest>)")
 args = parser.parse_args()
+# Defaults = the best run so far, muonium-normuon0.01-adamw3e-3-ramp-3b (experiments.md 2026-10-16): NorMuon 0.01 for the
+# matrices, AdamW 3e-3 for embedding + norms, wd 0.1, WSD 2% / 10%, batch 32 for the first third of the tokens, then 64.
+# LRs tuned for muonium don't carry over to other optimizers, which keep their own defaults.
+if args.learning_rate is None:
+    args.learning_rate = 3e-3 if args.optimizer == "muonium" and args.muonium_rest == "adamw" else 6e-4
+if args.muon_lr is None:
+    args.muon_lr = 0.01 if args.optimizer == "muonium" else 1.25e-3
+if args.batch_ramp is None and args.global_batch_size is None:
+    args.batch_ramp = "32:0.3333,64"
+if args.batch_ramp and args.batch_ramp.lower() == "none":
+    args.batch_ramp = None
+if args.global_batch_size is None:
+    args.global_batch_size = 64
 ARGS = args  # callbacks get the TrainingArguments as `args`
 BLOCK_SIZE = args.block_size  # context window
 MODEL_NAME = args.model_name
 DATA_DIR = os.path.expanduser(args.data_dir)
 SAVE_DIR = os.path.expanduser(args.save_dir or os.path.join(os.path.expandvars("/work/$USER/llama_models"), args.run_name or "latest"))
 
-print("Model name:", MODEL_NAME, "LR:", args.learning_rate, "Optimizer:", args.optimizer, *(["Muon LR:", args.muon_lr] if args.optimizer == "muon" else []), "WD:", args.weight_decay, "beta2:", args.beta2, "Run name:", args.run_name, "Packing:", args.packing, "Data dir:", DATA_DIR)
+print("Model name:", MODEL_NAME, "LR:", args.learning_rate, "Optimizer:", args.optimizer, *(["Muon LR:", args.muon_lr] if args.optimizer in ("muon", "muonium") else []), "WD:", args.weight_decay, "beta2:", args.beta2, "Run name:", args.run_name, "Packing:", args.packing, "Data dir:", DATA_DIR)
 
 
 def slurm_time_left():

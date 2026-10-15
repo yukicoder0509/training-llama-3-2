@@ -851,3 +851,21 @@ lands at the same tokens whatever `--token_budget` is; ti ≤ 1 is still a fract
 same steps: `32:0.3333,64` → 1,271 + 1,271 steps at 1B, 3,814 + 3,814 at 3B). The switch is at the last whole step
 within the stage's tokens (`32:1B,64` at 8,192 context: 3,814 steps = 0.9998B tokens). Note the fraction form scales
 with the budget: the 3B ramp run (552056) used batch 32 for 1B tokens, the 1B runs for 333M.
+
+## 2026-10-16 — NorMuon + AdamW 3e-3 + batch ramp at 3B tokens: new best, now the train.py defaults
+
+`muonium-normuon0.01-adamw3e-3-ramp-3b` (job 552056, 2:38 h): NorMuon 0.01, AdamW 3e-3, wd 0.1, WSD 2% / 10%, doc
+packing, `--batch_ramp=32:0.3333,64` (batch 32 for the first 1B tokens), 3B tokens. In-training eval 2.714.
+`eval_packing.py` (job 552057, same 1,850 val blocks):
+
+| Model | concat eval | doc eval |
+|---|---|---|
+| `muonium-normuon-lr0.01-3b` (previous best: AdamW 3e-4, no ramp) | 2.812 (ppl 16.7) | 2.773 (16.0) |
+| `muonium-normuon0.01-adamw3e-3-ramp-3b` | **2.779 (16.1)** | **2.715 (15.1)** |
+
+- −0.059 doc / −0.033 concat. At 1B the same two changes gave −0.114 (3.055 → 2.941), so about half the gain remains
+  at 3B.
+- These settings are now train.py's defaults (`--optimizer muonium --muonium_algorithm normuon`, AdamW LR 3e-3,
+  Muon LR 0.01, `--batch_ramp 32:0.3333,64`). Other optimizers keep their old LR defaults (6e-4; muon 1.25e-3).
+  `--global_batch_size` or `--batch_ramp=none` turns the ramp off; train_scorer.py passes `--global_batch_size=256`, so
+  the scorer / proxy runs are unchanged. profile.sbatch pins batch 64.

@@ -67,17 +67,17 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--token_budget` | `6e9` | Training tokens; steps = budget / (global batch x 8192). No padding, so every token counts |
-| `--global_batch_size` | `64` | Sequences per step (64 x 8192 = 0.5M tokens) |
+| `--global_batch_size` | `64` | Sequences per step (64 x 8192 = 0.5M tokens). Giving it turns off the default ramp |
 | `--per_device_batch` | `4` | Max sequences per GPU per micro-batch; grad accum covers the rest |
-| `--batch_ramp` | none | `"B1:t1,...,Bn"`: batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count (`32:1e9,64`, or `32:1B,64` / `32:333M,64`): the switch is at the same tokens for any budget. ti ≤ 1 is a fraction of the budget (`32:0.3333,64`: 333M of 1B, 1B of 3B). Switches at the last whole step within the stage; LRs and the LR schedule are unchanged. Overrides `--global_batch_size` |
-| `--learning_rate` / `--weight_decay` / `--beta2` | `6e-4` / `0.1` / `0.95` | AdamW (untuned starting points) |
+| `--batch_ramp` | `32:0.3333,64` | `none` for a fixed batch. `"B1:t1,...,Bn"`: batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count (`32:1e9,64`, or `32:1B,64` / `32:333M,64`): the switch is at the same tokens for any budget. ti ≤ 1 is a fraction of the budget (`32:0.3333,64`: 333M of 1B, 1B of 3B). Switches at the last whole step within the stage; LRs and the LR schedule are unchanged. Overrides `--global_batch_size` |
+| `--learning_rate` / `--weight_decay` / `--beta2` | `3e-3` (muonium), else `6e-4` / `0.1` / `0.95` | Peak LR; with muon / muonium the AdamW (embedding, norms) part |
 | `--warmup_frac` / `--decay_frac` | `0.02` / `0.1` | Linear warmup, then WSD with linear decay to 0 over the final fraction (0.1 as in MiniCPM; runs before 2026-10-14 used 0.2) |
 | `--lr_schedule` / `--min_lr_ratio` | `wsd` / `0.1` | `cosine`: cosine from the peak to `min_lr_ratio` × peak (Llama 2/3). `wsd2`: warmup, stable, decay to `--stable2_lr_ratio` × peak over `--decay1_frac`, stable for `--stable2_frac`, then decay to 0 over `--decay_frac` |
 | `--seed` | none | Init, data order and Sophia's label sampling (repeat-seed runs) |
 | `--adam_eps` | `1e-8` | Adam ε (Llama 2: 1e-5) |
-| `--optimizer` | `adamw` | `adamw` (fused torch AdamW), `adam_mini`, `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`), `muonium` (pip `muonium`, see below), `sophia` (SophiaG, `sophia.py` vendored from the official repo) or `soap` (see below); LR = `--learning_rate` |
-| `--muon_lr` / `--muon_momentum` | `1.25e-3` / `0.95` | Muon LR for the matrices; `--learning_rate` is then the AdamW (embedding, norms) LR. `muonium` scales by sqrt(max(1, rows/cols)): best 0.01 (experiments.md 2026-10-15) |
-| `--muonium_algorithm` / `--muonium_rest` / `--muon_wd` | `muon` / `adamw` / `--weight_decay` | `--optimizer muonium`: `normuon` adds per-neuron second-moment normalization; `--muonium_rest sophia` puts SophiaG on the embedding + norms |
+| `--optimizer` | `muonium` | `adamw` (fused torch AdamW), `adam_mini`, `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`), `muonium` (pip `muonium`, see below), `sophia` (SophiaG, `sophia.py` vendored from the official repo) or `soap` (see below); LR = `--learning_rate` |
+| `--muon_lr` / `--muon_momentum` | `0.01` (muonium), `1.25e-3` (muon) / `0.95` | Muon LR for the matrices; `--learning_rate` is then the AdamW (embedding, norms) LR. `muonium` scales by sqrt(max(1, rows/cols)): best 0.01 (experiments.md 2026-10-15) |
+| `--muonium_algorithm` / `--muonium_rest` / `--muon_wd` | `normuon` / `adamw` / `--weight_decay` | `--optimizer muonium`: `normuon` adds per-neuron second-moment normalization; `--muonium_rest sophia` puts SophiaG on the embedding + norms |
 | `--soap_impl` / `--soap_betas` / `--soap_precond_freq` | `official` / `0.95,0.95` / `10` | SOAP (`--optimizer soap`, ε = `--adam_eps`). `official`: `soap.py` (paper authors) with the work split across GPUs by `soap_dist.py`. `meta`: facebookresearch `distributed_shampoo` (`--soap_block`, `--soap_comm_dtype`), no faster at the same preconditioner. +31% step time at 0.5M batch, +7% at 2M |
 | `--sophia_rho` / `--sophia_betas` / `--sophia_hess_interval` | `0.05` / `0.965,0.99` / `10` | SophiaG (official GPT-2 values). The Hessian pass every k steps reruns the step's batch with sampled labels: +1/k compute. Use weight decay ~2x AdamW's (0.2). Watch `train/sophia_win_rate` (official guidance: 0.1–0.5) |
 | `--ddp_find_unused` / `--ddp_bucket_cap_mb` / `--ddp_bf16_grads` | off / `200` / off | DDP settings (+6% vs Trainer's defaults of on / 25 MB); bf16 all-reduce gives no gain with large buckets |
@@ -107,13 +107,16 @@ against tokens locally (login node, reads W&B):
 python plot_runs.py dvqj42sv dkyqsbe6 --out plots/wsd_vs_cosine_1h.png   # train/eval loss and ppl vs tokens seen
 ```
 
-Best recipe so far (experiments.md 2026-10-15): NorMuon + AdamW with the batch ramp,
+The defaults are the best run so far, `muonium-normuon0.01-adamw3e-3-ramp-3b` (doc eval ppl 15.1 at 3B tokens,
+experiments.md 2026-10-16): NorMuon LR 0.01 on the decoder-layer matrices, AdamW 3e-3 on the embedding + norms, wd 0.1,
+WSD 2% / 10%, doc packing, batch 32 for the first third of the tokens, then 64. So it is just
 
 ```
-sbatch --time=5:00:00 run.sbatch --run_name=normuon-ramp-3b --token_budget=3e9 --optimizer=muonium \
-    --muonium_algorithm=normuon --muonium_rest=adamw --muon_lr=0.01 --learning_rate=3e-3 --weight_decay=0.1 \
-    --lr_schedule=wsd --warmup_frac=0.02 --decay_frac=0.1 --batch_ramp=32:0.3333,64
+sbatch --time=5:00:00 run.sbatch --run_name=normuon-ramp-3b --token_budget=3e9
 ```
+
+Another `--optimizer` keeps its own LR defaults (6e-4; Muon 1.25e-3), not the muonium ones; the batch ramp still
+applies unless `--batch_ramp=none` or `--global_batch_size` is given.
 
 ## Data selection (small scoring model)
 
