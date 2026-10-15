@@ -10,6 +10,7 @@
 #SBATCH --time=8:00:00  # lab cap: 64 H200-hours per run = 8 GPUs x 8 h
 #SBATCH --output=logs/%x-%j.out
 
+# Small scoring model: TRAIN_SCRIPT=train_scorer.py sbatch run.sbatch ... (sbatch --export=ALL,TRAIN_SCRIPT=train_scorer.py)
 # Fewer GPUs (e.g. the 16 H200-hour baseline): sbatch --gpus-per-node=2 --cpus-per-task=24 --time=8:00:00 run.sbatch ...
 # train.py stops 5 min before the job's time limit (squeue) and still saves the model.
 
@@ -44,7 +45,7 @@ $NUMA_PREFIX accelerate launch \
     --num_processes=$NUM_GPUS \
     --mixed_precision=bf16 \
     --main_process_port=$((29500 + SLURM_JOB_ID % 1000)) \
-    train.py --model_name=$MODEL_NAME --fused_ce --torch_compile "$@"  # --no-fused_ce / --no-torch_compile to disable
+    ${TRAIN_SCRIPT:-train.py} --model_name=$MODEL_NAME --fused_ce --torch_compile "$@"  # --no-fused_ce / --no-torch_compile to disable
 
 END_TIME=$(date +%s)
 echo "========================================"

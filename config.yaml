@@ -1,0 +1,37 @@
+# Loss-based soft reweighting of dolma3_mix rows (build_pool.py, select_rows.py; experiments.md 2026-10-15).
+# Step 0: the environment, as found.
+
+data:
+  repo: allenai/dolma3_mix-150B-1025
+  revision: afa92bfb22366821c5e6cd427cdd036b34b713ef
+  # jsonl.zst, one row per line: id, text, metadata (CC: text_hash, weborganizer_max, original_word_count;
+  # PDFs: weborganizer_max; stack_edu: language). Dirs data/<source>-<topic>[-<CC quality vigintile>]/shard_*.jsonl.zst
+  root: /work/benyang0509/hf_cache/hub/datasets--allenai--dolma3_mix-150B-1025/snapshots/afa92bfb22366821c5e6cd427cdd036b34b713ef
+  # 6,081 files in the order `datasets` resolves them, with rows per file (prepare_data.py pass 1); 104,020,922 rows
+  doc_counts: /work/benyang0509/dolma3_llama/doc_counts.json
+  tokenizer: NousResearch/Llama-3.2-1B  # same ids as meta-llama/Llama-3.2-1B; each doc = BOS text EOS
+
+split:  # ranks = positions in the OJ's seed-42 shuffle of all rows (prepare_data.py)
+  shuffle_seed: 42
+  num_eval: 50000          # official eval: the last 50k ranks. Never used for any selection decision
+  scorer_train_end: 5198546  # ranks [0, this) = /work/benyang0509/dolma3_llama/train.bin, the scorer's training data
+  num_dev: 10000           # our dev set: the 10k ranks right before the official eval
+
+scorer:
+  # train_scorer.py, 75.5M non-embedding (768 hidden, 12 layers), 2048 context, 6B tokens of train.bin
+  model: /work/benyang0509/llama_models/scorer-muon0.01-adamw3e-3-6b
+  prefix_tokens: 512       # score BOS + the first 511 tokens of each unique text
+  min_scored: 32           # fewer scored tokens -> z = 0
+
+pool:
+  dir: /work/benyang0509/dolma3_reweight
+  seed: 20261015
+  target_tokens: 1.9e+10
+  est_tokens_per_row: 1511.6  # train.bin: 7,858,262,306 tokens / 5,198,546 rows
+  z_clip: 3.0
+
+training:
+  # train.py / train_scorer.py read --data_dir: train.bin + val.bin (flat uint32, BOS text EOS), and dev.bin if present
+  # (logged as eval/dev_loss). select_rows.py writes such a dir; val.bin links to the official val.bin (10k eval docs).
+  official_val: /work/benyang0509/dolma3_llama/val.bin
+  gpus: 8x H200 per node (partition 8gpus, 12 CPUs per GPU)

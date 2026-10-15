@@ -572,3 +572,282 @@ default). One change per run from the baseline (wd 0.2, decay 20%, seeds 3.320 /
   40% are clearly worse. Before the decay the longer-decay runs are ahead (decay0.4 3.464 vs 3.494 at 0.87B), but
   they spend fewer steps at the peak LR and end higher. Keep 20% (or 10%); not worth a combined wd0.1 + decay0.1 run.
 - `--decay_frac` default changed to 0.1 (MiniCPM WSD value; not worse than 0.2 here). Earlier runs passed or defaulted to 0.2.
+
+## 2026-10-15 — Two-stage WSD decay (`--lr_schedule wsd2`): stable2 length scan (Sophia, 1B tokens)
+
+Schedule: warmup 2% → stable1 at peak → linear decay to 0.1 × peak over 5% of steps → stable2 at 0.1 × peak for
+`--stable2_frac` → linear decay to 0 over 5% (`--decay1_frac=0.05 --stable2_lr_ratio=0.1 --decay_frac=0.05`); stable1
+gets the rest. Checked in W&B (s2 = 0.3): 5e-5 to step 1,144, 5e-6 from ~1,240. Sophia LR 5e-5, ρ 0.05, k 10, wd 0.2,
+0.5M batch, doc packing, 1,907 steps.
+
+| Run (W&B) | Schedule | Loss at 0.80B | Final eval loss (doc) |
+|---|---|---|---|
+| `sophia-lr5e-5-decay0.1-1b` (`hpruhuhp`) | plain WSD, 10% linear decay (baseline) | 3.567 | **3.375** |
+| `docpack-sophia-lr5e-5-1b` (`t93qlrhd`) | plain WSD, 20% linear decay | 3.549 | 3.368 |
+| `sophia-wsd2-s2-0-1b` (`w2tyale7`) | wsd2, stable2 0% | 3.524 | 3.394 |
+| `sophia-wsd2-s2-0.1-1b` (`e4axicm4`) | wsd2, stable2 10% | 3.540 | 3.404 |
+| `sophia-wsd2-s2-0.2-1b` (`6qixkxsc`) | wsd2, stable2 20% | 3.518 | 3.470 |
+| `sophia-wsd2-s2-0.3-1b` (`axdkidep`) | wsd2, stable2 30% | 3.583 | 3.539 |
+
+- Every stable2 length is worse than the plain linear decay, and longer is monotonically worse (+0.019, +0.029,
+  +0.095, +0.164). The plateau at 0.1 × LR makes little progress (s2 = 0.2: 3.518 at 0.80B, 3.470 at the end), and
+  the steps it takes come out of the peak-LR stage. Even stable2 = 0 (a kinked decay: 1 → 0.1 in 5%, 0.1 → 0 in 5%)
+  loses 0.019 to the straight 10% line. Same picture as the decay-fraction scan: at 1B tokens the run is short of
+  peak-LR steps, so no time should be spent at low LR beyond a short final decay.
+- Decay 10% vs 20% under doc packing: 3.375 vs 3.368 (+0.007, about the seed spread); the 10% default stands.
+
+## 2026-10-15 — Muon (pip `muonium` 0.2.0) at 1B tokens: package defaults and LR sweep
+
+`--optimizer muonium`: Muon for the 112 decoder-layer matrices (973M params; momentum 0.95 Nesterov, Polar Express 5
+steps, LR × sqrt(max(1, rows/cols)), cautious decoupled wd), muonium's fused AdamW (β 0.9 / 0.95, ε 1e-8) for the tied
+embedding + norms (263M). 0.5M batch, doc packing, 1,907 steps, 8 H200. The first step compiles muonium's update for
+~8–12 min (`TORCHINDUCTOR_CACHE_DIR=/work/$USER/inductor_cache` shares the cache across jobs); then ~ AdamW speed.
+
+| Run (W&B) | Muon LR | AdamW LR | wd | Decay | Final eval loss (doc) |
+|---|---|---|---|---|---|
+| `muonium-default-1b` (`ctf5qm8f`) | 1e-3 (package default, one LR) | 1e-3 | 0.1 | 20% | 3.380 |
+| `muonium-muon-lr0.005-1b` (`wxqu9zmt`) | 0.005 | 3e-4 | 0.1 | 10% | 3.091 |
+| `muonium-muon-lr0.01-1b` (`lbuf7ebv`) | **0.01** | 3e-4 | 0.1 | 10% | **3.063** |
+| `muonium-muon-lr0.02-1b` (`us4l6inz`) | 0.02 | 3e-4 | 0.1 | 10% | 3.156 |
+| `muonium-muon-lr0.04-1b` (`pxqevoqw`) | 0.04 | 3e-4 | 0.1 | 10% | 3.526 |
+| `muonium-normuon-lr0.01-1b` (`gzlluua7`), NorMuon | 0.01 | 3e-4 | 0.1 | 10% | **3.055** |
+| `muonium-normuon-sophia-1b` (`upzn271q`), NorMuon + Sophia (lr 5e-5, ρ 0.05, wd 0.2) on embedding + norms | 0.01 | – | 0.1 / 0.2 | 10% | 3.159 |
+| Sophia baseline `sophia-lr5e-5-decay0.1-1b` (`hpruhuhp`) | – | – | 0.2 | 10% | 3.375 |
+
+- **Muon at 0.01 beats Sophia by 0.31 nats at 1B** (3.063 vs 3.375), about what Sophia reached at 2B (3.047).
+  Clear optimum at 0.01–0.005 (half of Keller Jordan's 0.02); 0.04 is unstable early (4.0 at 0.35B).
+- The package default (1e-3) is 10x too low here but already roughly ties Sophia (3.380 vs 3.368, both 20% decay).
+- **NorMuon (same settings, LR 0.01) edges out Muon: 3.055 vs 3.063** (0.008, ~2.5x the 0.003 seed noise seen at 1.1B;
+  one seed each). NorMuon is picked for the Sophia hybrid (Sophia replacing AdamW on embedding + norms).
+- **Sophia in place of AdamW for embedding + norms hurts: 3.159 vs 3.055** (+0.10), and halves throughput
+  (2.1e5 vs 4.2e5 tok/s: Hessian re-forwards plus the slower path). Curves track until ~0.75B, then the AdamW hybrid
+  gains much more in the decay. Keep NorMuon + AdamW.
+
+## 2026-10-15 — How much does the original train.bin repeat? (`repetition.py`, job 547494, 52 s)
+
+Exact repetition of whole docs (identical token sequences) in the original sample vs the dedup one. The first 3B tokens
+stand for a 3B run (docs are shuffled at prepare time; runs draw random blocks).
+
+| Range | Docs | Distinct texts | Tokens in repeat copies | Tokens in texts with 2 / 3–4 / ≥5 copies | Train docs = a val doc |
+|---|---|---|---|---|---|
+| original, first 3B | 2.29M | 91.1% | **0.26B (8.6%)** | 14.8% / 1.7% / 0.0% | 2,597 docs (697 of 9,980 val texts) |
+| original, whole 7.86B | 5.20M | 91.4% | 0.59B (7.5%) | 13.1% / 1.4% / 0.0% | 13,054 docs (1,590 val texts) |
+| dedup, first 3B | 2.09M | 99.7% | 0.0% | 0.0% | 14 val texts, 0.01M tokens |
+| dedup, whole 7.18B | 4.07M | 99.8% | 0.0% | 0.0% | 20 val texts, 0.01M tokens |
+
+- Repetition in the original sample is mild: nearly all of it is texts seen 2–4 times. The heavily upsampled texts
+  (thousands of copies, up to 9,329) are tiny docs that add up to ~0 tokens. The leftover copies in dedup are the same
+  kind of near-empty docs.
+- Upper bound for 3B: if all 8.6% repeat tokens were worthless, it equals ~9% fewer tokens. Sophia's local slope
+  (2B 3.047 → 3B 2.897, dL/dlnD ≈ −0.37) gives ≤ ~0.03 nats. 2–4x repeats are nearly as good as fresh data
+  (Muennighoff et al. 2023), so the real effect should be well below that.
+- Contamination is the bigger issue: 7% of val texts (697) appear in the first 3B of original train, ~3.7 copies
+  each; 16% (1,590) in the whole file. That favours the original data on `val.bin` eval.
+
+
+## 2026-10-15 — Is train.bin representative of the mix? Token shares per (source × topic × quality vigintile × length) (`metadata_dist.py`, job 548010, 2 min)
+
+Cells come from each doc's directory (`<source>-<topic>[-<CC quality vigintile>]`) × 6 token-length bins, 1,252
+non-empty cells. Population: all 104.0M train-eligible docs (~157B tokens, from per-doc chars × the cell's
+tokens/char). Train sets: exact token counts (docs line up with `train.bin` in file order). Plot: `plots/metadata_dist.png`.
+
+| Train set | TV distance vs mix (all cells) | source | topic | CC vigintile | length |
+|---|---|---|---|---|---|
+| original (5% uniform doc sample) | **0.0087** (sampling noise alone: 0.0084 ± 0.0005) | 0.002 | 0.004 | 0.001 | 0.001 |
+| dedup (uniform over unique texts) | **0.327** | 0.146 | 0.214 | 0.130 | 0.072 |
+
+- **Original train.bin is as close to the mix as a random sample can be.** Doc counts per cell: chi²/dof 0.95, 1 cell
+  of 686 (≥1000 docs) beyond |z| 3 (~1.9 expected). The only visible deviations are tiny olmOCR topics (<0.01%).
+- **Dedup changes the mixture a lot.** Dolma 3 sets its mix weights by repeating docs, so one copy per text undoes them:
+  CC vigintile 19 (top quality) 41.7% → 22.6%, olmOCR PDFs 12.6% → 27.1%, finemath 2.6% → 1.4%, stack_edu 7.0% →
+  5.7%, docs ≥32k tokens 10.2% → 15.3%. Within a 5% sample the upsampling shows up as more docs from those cells, not
+  as repeats (hence only 8.6% repeat tokens in the first 3B, entry above).
+- So the dedup vs original runs compared two different mixtures more than repeated vs unique data, and were scored on
+  `val.bin`, which follows the original mix (and overlaps the original train). Dedup still came out 0.016 ahead at 1B.
+  A clean test of dedup alone would draw unique texts with per-cell weights matching the mix's token shares (enough
+  unique tokens exist: ~63B in total, ~14B in CC vigintile 19 vs 2.5B needed for 6B).
+
+## 2026-10-15 — Small scoring model for perplexity filtering: baseline (`train_scorer.py`)
+
+`train_scorer.py` = train.py with the Llama 3.2 1B config shrunk to 768 hidden / 2048 FFN / 12 layers / 12 query + 4 KV
+heads / head_dim 64, 2048 context, plain RoPE (θ 5e5, no llama3 scaling): 174M params (98.5M tied embedding + 75.5M
+layers). 2048-token blocks × 256 = 0.5M tokens/step (32/GPU, no grad accum), doc packing, WSD 2% / 10%, wd 0.1.
+Muon (muonium) on the layer matrices, AdamW on embedding + norms. W&B project
+`bendoris0509-national-yang-ming-chiao-tung-university/llama3.2-arch-small-scoring-model`.
+
+| Run (W&B, job) | Tokens | Muon LR | AdamW LR | Final eval loss (2048 blocks, ppl) |
+|---|---|---|---|---|
+| `scorer-muon-1b` (`o5uvb6uk`, 548614) | 1B (1,907 steps) | 0.01 | 1e-3 | 3.269 (26.3) |
+
+- 2.13M tokens/s on 8 H200 (MFU 0.34); 19 min job, ~9 min of it the first-step compile. Saved to
+  `/work/$USER/llama_models/scorer-muon-1b`.
+- Eval loss uses 2048-token blocks: not comparable with the 8192-context 1B runs.
+- The decay took it from 3.382 to 3.269; before the decay it was still dropping ~0.012 per eval (~50M tokens), so a
+  longer budget should help.
+- Fixes: `rope_scaling: null` in `--config_overrides` now means plain RoPE (transformers 5 otherwise sets
+  `rope_parameters` to None and the model build fails, job 548573).
+
+## 2026-10-15 — NorMuon + AdamW at 3B tokens vs the current Hub model
+
+`muonium-normuon-lr0.01-3b` (`1c1uxoe1`, job 547240): NorMuon LR 0.01 (matrices) + AdamW 3e-4 (embedding, norms), wd 0.1,
+doc packing, WSD 2% / 10%, fixed 0.5M batch (no ramp), 5,722 steps, 2:12 h, 427k tokens/s. In-training eval 2.774.
+Both checkpoints through `eval_packing.py` (job 549540, same 1,850 val blocks):
+
+| Model | concat eval | doc eval |
+|---|---|---|
+| `ramp-s05-lr5e-5-3b` (Sophia + batch ramp, concat-trained; on the Hub) | 2.870 (ppl 17.6) | 2.879 (17.8) |
+| `muonium-normuon-lr0.01-3b` | **2.812 (16.7)** | **2.773 (16.0)** |
+
+- NorMuon + AdamW wins under both protocols: −0.058 concat, −0.106 doc, with fewer steps (5,722 vs 7,628) and no ramp.
+
+### Scoring model LR sweep (1B tokens, 1,907 steps; same setup as `scorer-muon-1b`)
+
+| Run (W&B) | Muon LR | AdamW LR | Final eval loss (2048 blocks) |
+|---|---|---|---|
+| `scorer-muon0.005-adamw1e-3-1b` (`wpywcrtf`) | 0.005 | 1e-3 | 3.285 |
+| `scorer-muon-1b` (`o5uvb6uk`) | 0.01 | 1e-3 | 3.269 |
+| `scorer-muon0.02-adamw1e-3-1b` (`rx9j83fy`) | 0.02 | 1e-3 | 3.283 |
+| `scorer-muon0.04-adamw1e-3-1b` (`b616ncdh`) | 0.04 | 1e-3 | 3.442 |
+| `scorer-muon0.01-adamw3e-4-1b` (`cqkuj3eh`) | 0.01 | 3e-4 | 3.347 |
+| `scorer-muon0.01-adamw3e-3-1b` (`lfsusnqc`) | 0.01 | **3e-3** | **3.252** |
+| `scorer-muon0.01-adamw1e-2-1b` (`7t6g91jk`) | 0.01 | 1e-2 | 3.256 |
+
+- Muon LR 0.01 is best here too (same as the 1B model). AdamW (embedding + norms) prefers a higher LR than the 1B
+  model's 3e-4: 3e-3 and 1e-2 tie (within 0.004), 3e-4 is 0.095 worse.
+- First 0.005 attempt (549195) hung at startup on 25a-hgpn083 (no output for 45 min); rerun as 550143.
+- 6B run with Muon 0.01 / AdamW 3e-3: `scorer-muon0.01-adamw3e-3-6b` (job 550297), then `score_docs.py` on it (550298).
+
+## 2026-10-15 — NorMuon + AdamW + batch ramp at 1B tokens
+
+Same as `muonium-normuon-lr0.01-1b` (NorMuon 0.01, AdamW 3e-4, wd 0.1, WSD 2% / 10%, doc packing) plus
+`--batch_ramp=32:0.3333,64` (batch 32 for the first 1/3 of the tokens, then 64; LRs unchanged).
+
+| Run (W&B, job) | Steps | Final eval loss (doc) |
+|---|---|---|
+| `muonium-normuon-lr0.01-1b` (`gzlluua7`, 544764), fixed 64 | 1,907 | 3.055 |
+| `muonium-normuon-lr0.01-ramp-1b` (`91r4lm1m`, 550180) | 2,542 | **3.003** |
+
+- The ramp helps NorMuon too: −0.052 at 1B (Sophia gained −0.050 at 1.1B, −0.027 at 3B). One seed each, but far
+  beyond the 0.003 seed noise seen at 1.1B. 1:03 h job (vs 0:57), the extra steps are small-batch steps.
+
+## 2026-10-15 — 6B scoring model, and per-doc scores of 1B held-out tokens (`score_docs.py`)
+
+`scorer-muon0.01-adamw3e-3-6b` (`ap3qkov5`, job 550297): 174M scorer, Muon 0.01 / AdamW 3e-3, 6B tokens (11,444 steps),
+55 min. Final eval loss **2.986** (2048 blocks; 1B run: 3.252).
+
+Scored (job 550298, 39 min, 1 GPU): the 661,539 docs right after train.bin in the seed-42 shuffle (0.996B tokens; not in
+train.bin, not eval), each in 2048-token windows. Output in `/work/$USER/dolma3_llama/scores/scorer-muon0.01-adamw3e-3-6b/`:
+`scores.parquet` (rank, text_hash, key, source, topic, vigintile, n_tokens, n_pred, mean_loss), `percentiles.csv`
+(p1–p99 per group and over all, weighted by docs and by tokens).
+
+| Percentile of mean_loss (all docs) | p1 | p5 | p10 | p25 | p50 | p75 | p90 | p95 | p99 |
+|---|---|---|---|---|---|---|---|---|---|
+| by docs | 1.00 | 1.51 | 1.84 | 2.55 | 3.10 | 3.49 | 3.86 | 4.14 | 5.11 |
+| by tokens | 0.71 | 1.55 | 1.93 | 2.55 | 3.05 | 3.42 | 3.71 | 3.92 | 4.66 |
+
+- Loss depends mostly on the source: median per doc is 1.85 for code (stack_edu), 2.55–2.66 for arXiv / finemath /
+  PDFs, 3.2 for common_crawl and wiki. A single global cut would remove almost only common_crawl (high cut) or
+  only code and math (low cut); per-group percentiles keep the mix.
+- Both tails hold junk candidates: near-zero loss on huge docs (three finemath docs of ~520k tokens at loss 0.004–
+  0.005, i.e. repeated text; a 3.0M-token PDF at 0.46); 0.6% of tokens have loss < 0.5, and 0.6% have loss > 5.
+- 188 docs over 100k tokens hold 3.9% of the tokens. In small groups one doc sets the token-weighted percentiles
+  (e.g. pdf:software_development p1–p20 = 0.465 is the single 3.0M-token doc, 22% of the group), so doc-weighted
+  percentiles are the steadier basis for thresholds; the token-weighted ones show how much data a cut removes.
+
+### LR retune with the batch ramp (NorMuon + AdamW, 1B tokens, `--batch_ramp=32:0.3333,64`, 2,542 steps)
+
+| Run (W&B) | Muon LR | AdamW LR | Final eval loss (doc) |
+|---|---|---|---|
+| `muonium-normuon0.005-adamw3e-4-ramp-1b` (`ou44oo9j`) | 0.005 | 3e-4 | 3.023 |
+| `muonium-normuon0.0075-adamw3e-4-ramp-1b` (`rva7kuvs`) | 0.0075 | 3e-4 | 3.004 |
+| `muonium-normuon-lr0.01-ramp-1b` (`91r4lm1m`) | 0.01 | 3e-4 | 3.003 |
+| `muonium-normuon0.015-adamw3e-4-ramp-1b` (`zna1ualx`) | 0.015 | 3e-4 | 3.029 |
+| `muonium-normuon0.02-adamw3e-4-ramp-1b` (`flb6pxhf`) | 0.02 | 3e-4 | 3.101 |
+| `muonium-normuon0.01-adamw1e-3-ramp-1b` (`nemgffef`) | 0.01 | 1e-3 | 2.981 |
+| `muonium-normuon0.01-adamw3e-3-ramp-1b` (`nlo7gfgz`) | 0.01 | **3e-3** | **2.941** |
+
+- Muon LR: flat optimum at 0.0075–0.01 (same as without the ramp).
+- AdamW LR (embedding + norms) matters more than expected: 3e-4 → 3e-3 gains 0.062, and is still improving at the
+  edge of the grid (as for the scorer). Extending to 6e-3 and 1e-2 (jobs 551467, 551468).
+
+| `muonium-normuon0.01-adamw6e-3-ramp-1b` (551467) | 0.01 | 6e-3 | 2.943 |
+| `muonium-normuon0.01-adamw1e-2-ramp-1b` (551468) | 0.01 | 1e-2 | 2.950 |
+
+- AdamW LR peaks at 3e-3 (6e-3 within 0.002, 1e-2 +0.009).
+- Scaled to 3B tokens: `muonium-normuon0.01-adamw3e-3-ramp-3b` (job 552056), then `eval_packing.py` against
+  `muonium-normuon-lr0.01-3b` (job 552057, afterok).
+
+## 2026-10-15 — Perplexity bands on the proxy (174M scorer setup, 1B tokens)
+
+`score_bin.py` (job 551506) scored every train.bin doc with `scorer-muon0.01-adamw3e-3-6b`; `build_bands.py` drops each
+group's lowest / highest mean-loss docs (per-group doc percentiles). Proxy: `train_scorer.py`, Muon 0.01 / AdamW 3e-3,
+1B tokens, same eval (2048 blocks) as `scorer-muon0.01-adamw3e-3-1b`.
+
+| Run (job) | Drop low / high | Tokens kept | Final eval loss |
+|---|---|---|---|
+| `scorer-muon0.01-adamw3e-3-1b` (549199), unfiltered | – | 100% | 3.252 |
+| `proxy-band-hi5-1b` (551512) | 0 / 5% | 97.2% | 3.253 |
+| `proxy-band-lo5-1b` (551514) | 5% / 0 | 95.4% | 3.250 |
+| `proxy-band-lo5-hi5-1b` (551516) | 5% / 5% | 92.6% | 3.257 |
+| `proxy-band-lo5-hi10-1b` (552130) | 5% / 10% | 89.5% | 3.262 |
+| `proxy-band-lo5-hi15-1b` (552132) | 5% / 15% | 85.7% | 3.267 |
+
+- 5% cuts: all within 0.007 of unfiltered (seed noise ~0.003), i.e. no measurable effect on eval perplexity.
+- Eval loss rises steadily with the high cut (lo5: hi 5 / 10 / 15 → 3.257 / 3.262 / 3.267, +0.005 per 5%) while train loss
+  falls (3.277 / 3.228 / 3.202); dropping low-loss docs does the reverse (lo5 alone: train 3.320, eval 3.250). Filtering
+  makes the training data easier but less like the unfiltered eval set, so it does not help in-distribution perplexity.
+- Checked: each run read its band's train.bin, val.bin is the same file, and score doc starts / ends land on BOS / EOS
+  in train.bin (2,000 sampled docs, token counts sum to train.bin's length).
+
+## 2026-10-15 — Loss-based soft reweighting of rows (setup)
+
+Draw rows with probability ~ exp(beta * z), z = scorer loss standardized within topic; no row dropped or copied.
+Setup in `config.yaml`; `build_pool.py` (steps 1-3), `select_rows.py` (step 4; not `select.py`, which would shadow the
+stdlib `select` module), `train.py` evaluates `dev.bin` too when the data dir has one (`eval/dev_loss`).
+
+- Pool: rows with splitmix64(seed, global row index) < 12.73% (target 19B tokens), among ranks
+  [5,198,546, dev start): excludes the scorer's training rows (train.bin), our dev set and the official eval.
+  Row index, not the `id` field, so duplicate rows are drawn independently. Rows are tokenized once
+  (`/work/$USER/dolma3_reweight/tokens/`); selection copies tokens instead of re-reading text.
+- Dev set: the 10k ranks right before the official eval (`dolma3_reweight/dev.bin`); pool rows with a dev text_hash
+  are dropped. Official eval only for reference.
+- Topic for z: `scoring.group_name` (cc:/pdf: WebOrganizer topic, code: language, else the source).
+- Scorer: `scorer-muon0.01-adamw3e-3-6b`, BOS + first 511 tokens per unique text_hash, z clipped to ±3, n_scored < 32 → 0.
+- Jobs: manifest 552579 (array 0-7, 8 min), score 552580 (20 min; 20-doc check max diff 2.2e-7), merge 552727
+  (552588 failed: 2 files hold only repeats of texts first seen elsewhere, so no score file). Proxies (train_scorer.py, 1B tokens from a 3B
+  subpool, Muon 0.01 / AdamW 3e-3): beta 0 seeds 0/1/2 (552729/552731/552733), beta −0.25 (552735), beta 0.25
+  (552737), beta 0.5 (552739). Same seed 0 subpool for all beta runs.
+- Pool: 12,574,477 rows, 10,271,749 unique texts (18.3% of rows repeat a text).
+- Merge (552727): pool 12,547,298 rows / 18.97B tokens after dropping 27,179 rows whose text is a dev text; 1.10% of
+  rows (0.01% of tokens) have n_scored < 32 → z = 0; 1.0% of rows clipped at |z| = 3.
+- Topic row shares vs the full mix: max 0.012 pp before the dev drop. After it, pdf:science_math_and_technology is
+  −0.121 pp: one 6-token text, "[REMOVED]" (a PDF placeholder), has 22,832 copies in the pool and one in dev, so all
+  copies go (137k tokens, 0.0007% of the pool). Kept the rule; token shares are unaffected.
+- Selections (1B from a 3B subpool, seed 0): selected fraction per z bin is flat at 0.33 for beta 0; for beta 0.5 it
+  rises from 0.09 (z < −2.5) to 0.81 (z > 2.5), no bin saturated; mean z of the selection −0.19 / +0.18 / +0.35 for
+  beta −0.25 / 0.25 / 0.5; topic token shares move ≤ 0.35 pp.
+
+### Reweighting proxies (train_scorer.py, 1B tokens from a 3B subpool; dev = our 10k-doc dev set)
+
+| Run (job) | beta | Seed | Mean z selected | Dev loss | Official eval loss (reference) |
+|---|---|---|---|---|---|
+| `proxy-rw-b0-s0-1b` (552729) | 0 | 0 | 0.00 | 3.222 | 3.248 |
+| `proxy-rw-b0-s1-1b` (552731) | 0 | 1 | | 3.225 | 3.248 |
+| `proxy-rw-b0-s2-1b` (552733) | 0 | 2 | | 3.221 | 3.246 |
+| `proxy-rw-b-0.25-s0-1b` (552735) | −0.25 | 0 | −0.19 | 3.227 | 3.252 |
+| `proxy-rw-b0.25-s0-1b` (552737) | +0.25 | 0 | +0.18 | 3.223 | 3.249 |
+| `proxy-rw-b0.5-s0-1b` (552739) | +0.5 | 0 | +0.35 | 3.229 | 3.255 |
+
+- Baseline: mean 3.2227, std 0.0021 over 3 seeds; a win needs dev < 3.2185 (mean − 2 std). None qualifies.
+- Against the same-subpool baseline (seed 0, 3.222): −0.25 is +0.005, +0.25 +0.001, +0.5 +0.007. Loss is lowest at
+  beta 0 and rises both ways; dev and official eval agree (same order).
+- Decision: keep beta = 0 (uniform random rows). Like hard band filtering, tilting toward easier or harder docs moves
+  the training distribution away from the eval's and does not pay for itself at this scale.
+
+## 2026-10-16 — `--batch_ramp` stages by absolute tokens
+
+`--batch_ramp=B1:t1,...,Bn`: ti > 1 is now a token count (`32:1e9,64`, or `32:1B,64` / `32:333M,64`), so the switch
+lands at the same tokens whatever `--token_budget` is; ti ≤ 1 is still a fraction of the budget (old commands give the
+same steps: `32:0.3333,64` → 1,271 + 1,271 steps at 1B, 3,814 + 3,814 at 3B). The switch is at the last whole step
+within the stage's tokens (`32:1B,64` at 8,192 context: 3,814 steps = 0.9998B tokens). Note the fraction form scales
+with the budget: the 3B ramp run (552056) used batch 32 for 1B tokens, the 1B runs for 333M.

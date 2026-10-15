@@ -20,7 +20,6 @@ START_TIME = time.time()
 print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)
 
 # Constants
-BLOCK_SIZE = 8192  # context window (DESCRIPTION.md)
 TOKENIZER = "NousResearch/Llama-3.2-1B"  # tokenizer.json byte-identical to meta-llama/Llama-3.2-1B (gated for us)
 
 # Argument
@@ -30,13 +29,18 @@ parser.add_argument("--token_budget", type=float, default=6e9, help="Training to
 parser.add_argument("--learning_rate", type=float, default=6e-4, help="Peak LR (untuned starting point for 1B at ~0.5M-token batches)")
 parser.add_argument("--warmup_frac", type=float, default=0.02, help="Linear warmup over this fraction of the steps")
 parser.add_argument("--decay_frac", type=float, default=0.1, help="--lr_schedule wsd: 0 = constant after warmup; >0 = linear decay to 0 over this fraction of the final steps (default 0.1, MiniCPM WSD; ties 0.2 for Sophia at 1.1B, experiments.md 2026-10-14; runs before that used 0.2)")
-parser.add_argument("--lr_schedule", type=str, default="wsd", choices=["wsd", "cosine"], help="wsd (warmup-stable-decay, see --decay_frac) or cosine (Llama 2/3: warmup, then cosine to --min_lr_ratio x peak)")
+parser.add_argument("--lr_schedule", type=str, default="wsd", choices=["wsd", "wsd2", "cosine"], help="wsd (warmup-stable-decay, see --decay_frac), wsd2 (warmup, stable, linear decay to --stable2_lr_ratio over --decay1_frac, stable2 at that LR for --stable2_frac, then linear decay to 0 over --decay_frac) or cosine (Llama 2/3: warmup, then cosine to --min_lr_ratio x peak)")
+parser.add_argument("--decay1_frac", type=float, default=0.05, help="--lr_schedule wsd2: first decay (peak -> --stable2_lr_ratio x peak) over this fraction of the steps")
+parser.add_argument("--stable2_frac", type=float, default=0.1, help="--lr_schedule wsd2: second stable stage at --stable2_lr_ratio x peak, fraction of the steps")
+parser.add_argument("--stable2_lr_ratio", type=float, default=0.1, help="--lr_schedule wsd2: LR of the second stable stage / peak")
 parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="--lr_schedule cosine: final LR / peak (Llama 2: 0.1)")
 parser.add_argument("--adam_eps", type=float, default=1e-8, help="Adam epsilon (Llama 2: 1e-5)")
 parser.add_argument("--weight_decay", type=float, default=0.1, help="AdamW weight decay (Llama 3 / GPT-3: 0.1)")
 parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for both optimizers (0.95: Llama/GPT-3; 0.999: PyTorch default)")
+parser.add_argument("--block_size", type=int, default=8192, help="Context window / training block (8192 = DESCRIPTION.md; train_scorer.py: 2048)")
+parser.add_argument("--config_overrides", type=str, default=None, help='JSON dict applied to the Llama 3.2 1B config with config.update, e.g. a smaller model (train_scorer.py)')
 parser.add_argument("--global_batch_size", type=int, default=64, help="Sequences of 8192 tokens per optimizer step (per-GPU batch x grad accum x GPUs); 64 = 0.5M tokens")
-parser.add_argument("--batch_ramp", type=str, default=None, help='Global batch-size ramp "B1:f1,B2:f2,...,Bn": batch Bi for fraction fi of the token budget, the last for the rest (e.g. "32:0.1,64"). Grad accum is fixed (enough for the largest Bi at --per_device_batch), so the micro-batch is Bi/(GPUs x accum); overrides --global_batch_size')
+parser.add_argument("--batch_ramp", type=str, default=None, help='Global batch-size ramp "B1:t1,B2:t2,...,Bn": batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count ("32:1e9,64", or with a K/M/B suffix: "32:1B,64"), ti <= 1 a fraction of the token budget ("32:0.1,64"). Grad accum is fixed (enough for the largest Bi at --per_device_batch), so the micro-batch is Bi/(GPUs x accum); overrides --global_batch_size')
 parser.add_argument("--per_device_batch", type=int, default=4, help="Max sequences per GPU per micro-batch; grad accum covers the rest")
 parser.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=False, help="Liger fused LM head + cross-entropy: never materializes the full fp32 logits (128k vocab x 8192 tokens = 4 GiB per sequence). On in run.sbatch/profile.sbatch; --no-fused_ce disables")
 parser.add_argument("--attn_implementation", type=str, default="flash_attention_3", help="HF attention backend (default flash_attention_3: needed by --packing doc): sdpa (cuDNN flash), flash_attention_3 (Hub kernel kernels-community/vllm-flash-attn3 via `kernels`), flash_attention_4 (pip flash-attn-4, CuTe DSL)")
@@ -51,7 +55,7 @@ parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=Tru
 parser.add_argument("--ddp_find_unused", action=argparse.BooleanOptionalAction, default=False, help="DDP find_unused_parameters. Trainer would set True (no gradient checkpointing), but Llama has no unused params; off is ~1%% faster (experiments.md)")
 parser.add_argument("--ddp_bf16_grads", action=argparse.BooleanOptionalAction, default=False, help="All-reduce gradients in bf16 (DDP bf16_compress_hook): half the NCCL traffic, grads stay fp32 locally. No gain with 200 MB buckets")
 parser.add_argument("--ddp_bucket_cap_mb", type=int, default=200, help="DDP gradient bucket size; 200 MB vs torch's 25 MB: ~5%% faster on 8 GPUs and ~10 GiB less memory (experiments.md)")
-parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon", "sophia", "soap"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini), muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py), sophia (SophiaG, official sophia.py) or soap (official soap.py, work split across GPUs by soap_dist.py); lr = --learning_rate for sophia and soap")
+parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam_mini", "muon", "muonium", "sophia", "soap"], help="adamw (torch AdamW), adam_mini (Adam-mini, pip adam-mini), muon (Muon for decoder-layer matrices + AdamW for the rest, muon_adamw.py), muonium (pip muonium: Muon for the decoder-layer matrices + its fused AdamW for embedding / norms, one LR = --learning_rate, wd = --weight_decay, package defaults for the rest), sophia (SophiaG, official sophia.py) or soap (official soap.py, work split across GPUs by soap_dist.py); lr = --learning_rate for sophia and soap")
 parser.add_argument("--soap_betas", type=str, default="0.95,0.95", help="SOAP beta1,beta2 (official defaults; beta2 also drives the preconditioner EMA). Epsilon: --adam_eps")
 parser.add_argument("--soap_precond_freq", type=int, default=10, help="SOAP: re-estimate the preconditioner eigenbases every k steps (official default 10)")
 parser.add_argument("--soap_impl", type=str, default="official", choices=["official", "meta"], help="official: soap.py (paper authors) split across GPUs by soap_dist.py. meta: facebookresearch distributed_shampoo with DefaultSOAPConfig (ZeRO-1 over DDP ranks, one AllGather of the updates, blocked preconditioners)")
@@ -61,7 +65,10 @@ parser.add_argument("--soap_max_precond_dim", type=int, default=10000, help="SOA
 parser.add_argument("--sophia_rho", type=float, default=0.05, help="SophiaG rho (clip threshold; official GPT-2 125M/770M: 0.05). Tune so train/sophia_win_rate stays in 0.1-0.5")
 parser.add_argument("--sophia_betas", type=str, default="0.965,0.99", help="SophiaG beta1,beta2 (official defaults)")
 parser.add_argument("--sophia_hess_interval", type=int, default=10, help="Re-estimate the diagonal Hessian (Gauss-Newton-Bartlett) every k steps (official: 10); one extra forward + backward of the full batch, i.e. ~1/k extra compute (official: same)")
-parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon: peak Muon LR (match_rms_adamw scaling; tuned on GPT-2, re-tune for Llama); --learning_rate is the AdamW part's")
+parser.add_argument("--muon_lr", type=float, default=1.25e-3, help="--optimizer muon / muonium: peak Muon LR (muon: match_rms_adamw scaling, tuned on GPT-2; muonium: x sqrt(max(1, rows/cols)), Keller Jordan's scale ~0.02); --learning_rate is the AdamW / Sophia part's")
+parser.add_argument("--muonium_algorithm", type=str, default="muon", choices=["muon", "normuon"], help="--optimizer muonium: update rule for the matrices (muon, or normuon: per-neuron second-moment normalization, muon_beta2 0.95)")
+parser.add_argument("--muonium_rest", type=str, default="adamw", choices=["adamw", "sophia"], help="--optimizer muonium: optimizer for the non-matrix params (tied embedding, norms) at --learning_rate / --weight_decay: muonium's AdamW, or SophiaG (--sophia_* flags, Hessian pass as in --optimizer sophia)")
+parser.add_argument("--muon_wd", type=float, default=None, help="--optimizer muonium: weight decay of the Muon matrices (default: --weight_decay)")
 parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
 parser.add_argument("--data_dir", type=str, default=os.path.expandvars("/work/$USER/dolma3_llama"), help="Dir with train.bin and val.bin (uint32, prepare_data.py)")
 parser.add_argument("--seed", type=int, default=None, help="Seed for the init, data order and Sophia's label sampling (default: torch's fixed default RNG for the init, Trainer seed 42 for the rest; set it for repeat-seed runs)")
@@ -69,6 +76,7 @@ parser.add_argument("--run_name", type=str, default=None, help="W&B run name; al
 parser.add_argument("--save_dir", type=str, default=None, help="Where to save the final model + tokenizer (default: /work/$USER/llama_models/<run_name or latest>)")
 args = parser.parse_args()
 ARGS = args  # callbacks get the TrainingArguments as `args`
+BLOCK_SIZE = args.block_size  # context window
 MODEL_NAME = args.model_name
 DATA_DIR = os.path.expanduser(args.data_dir)
 SAVE_DIR = os.path.expanduser(args.save_dir or os.path.join(os.path.expandvars("/work/$USER/llama_models"), args.run_name or "latest"))
@@ -99,25 +107,31 @@ assert args.global_batch_size % (PER_DEVICE_BATCH * WORLD_SIZE) == 0, "global ba
 GRAD_ACCUM = args.global_batch_size // (PER_DEVICE_BATCH * WORLD_SIZE)
 # Token budget -> steps. Every position of every sequence is a real token (packed documents, no padding).
 MAX_STEPS = args.max_steps or int(args.token_budget // (args.global_batch_size * BLOCK_SIZE))
-# Batch-size ramp: list of (global batch, optimizer steps). Each stage gets its fraction of the token budget. The LR
-# schedule (warmup / WSD decay) runs over the total optimizer steps, unchanged by the ramp.
+# Batch-size ramp: list of (global batch, optimizer steps). Each stage gets its tokens (a count, or a fraction of the
+# budget), rounded down to whole steps, so the batch changes at the first step boundary at or before the stage's token
+# mark. The LR schedule (warmup / WSD decay) runs over the total optimizer steps, unchanged by the ramp.
 RAMP = None
 if args.batch_ramp:
     stages = [part.split(":") for part in args.batch_ramp.split(",")]
     sizes = [int(st[0]) for st in stages]
-    fracs = [float(st[1]) for st in stages[:-1]]
-    fracs.append(1 - sum(fracs))
+    def stage_tokens(t):  # "1e9", "1B", "300M" -> tokens; <= 1 -> fraction of the budget
+        mult = {"K": 1e3, "M": 1e6, "B": 1e9}.get(t[-1].upper(), 1)
+        x = float(t[:-1] if mult != 1 else t) * mult
+        return x * args.token_budget if x <= 1 else x
+    stage_toks = [stage_tokens(st[1]) for st in stages[:-1]]
+    stage_toks.append(args.token_budget - sum(stage_toks))
+    assert stage_toks[-1] > 0, f"--batch_ramp stages use {sum(stage_toks[:-1]):.3g} tokens, budget {args.token_budget:.3g}"
     # The Trainer's grad accum is fixed: enough micro-batches for the largest batch at --per_device_batch; smaller
     # batches use smaller micro-batches (one static compile per size)
     GRAD_ACCUM = -(-max(sizes) // (WORLD_SIZE * args.per_device_batch))
-    assert all(b % (WORLD_SIZE * GRAD_ACCUM) == 0 for b in sizes) and fracs[-1] > 0, args.batch_ramp
-    RAMP = [(b, int(f * args.token_budget // (b * BLOCK_SIZE))) for b, f in zip(sizes, fracs)]
+    assert all(b % (WORLD_SIZE * GRAD_ACCUM) == 0 for b in sizes), args.batch_ramp
+    RAMP = [(b, int(t // (b * BLOCK_SIZE))) for b, t in zip(sizes, stage_toks)]
     if args.max_steps:  # short tests: keep the stage proportions in steps
         total = sum(n for _, n in RAMP)
         RAMP = [(b, max(1, round(n * args.max_steps / total))) for b, n in RAMP]
     MAX_STEPS = sum(n for _, n in RAMP)
     PER_DEVICE_BATCH = sizes[0] // (WORLD_SIZE * GRAD_ACCUM)
-    print("Batch ramp:", ", ".join(f"{b} x {n} steps ({b // (WORLD_SIZE * GRAD_ACCUM)}/GPU)" for b, n in RAMP),
+    print("Batch ramp:", ", ".join(f"{b} x {n} steps = {b * n * BLOCK_SIZE / 1e9:.3g}B tokens ({b // (WORLD_SIZE * GRAD_ACCUM)}/GPU)" for b, n in RAMP),
           f"x grad accum {GRAD_ACCUM}")
 
 
@@ -179,6 +193,24 @@ if RAMP is None:
 assert tokens_seen(MAX_STEPS) <= 6e9 or args.token_budget > 6e9, "over the 6B-token lab budget"
 WARMUP_STEPS = int(args.warmup_frac * MAX_STEPS)
 DECAY_STEPS = int(args.decay_frac * MAX_STEPS)
+if args.lr_schedule == "wsd2":  # warmup | stable1 | decay1 to r | stable2 at r | decay to 0 (DECAY_STEPS)
+    DECAY1_STEPS, STABLE2_STEPS = int(args.decay1_frac * MAX_STEPS), int(args.stable2_frac * MAX_STEPS)
+    STABLE1_END = MAX_STEPS - DECAY_STEPS - STABLE2_STEPS - DECAY1_STEPS
+    assert STABLE1_END >= WARMUP_STEPS, "wsd2: warmup + decay1 + stable2 + decay exceed the run"
+    print(f"wsd2: warmup {WARMUP_STEPS}, stable1 to step {STABLE1_END}, decay1 {DECAY1_STEPS} to {args.stable2_lr_ratio} x peak, "
+          f"stable2 {STABLE2_STEPS}, decay {DECAY_STEPS} to 0")
+
+    def wsd2_lambda(step):
+        r = args.stable2_lr_ratio
+        if step < WARMUP_STEPS:
+            return step / max(1, WARMUP_STEPS)  # as HF's get_wsd_schedule
+        if step < STABLE1_END:
+            return 1.0
+        if step < STABLE1_END + DECAY1_STEPS:
+            return 1.0 - (1.0 - r) * (step - STABLE1_END) / DECAY1_STEPS
+        if step < MAX_STEPS - DECAY_STEPS:
+            return r
+        return r * max(0.0, (MAX_STEPS - step) / DECAY_STEPS)
 
 # Prepare tokenizer and model
 print("=== Loading tokenizer and model...")
@@ -198,6 +230,16 @@ config = LlamaConfig(
     attention_bias=False, attention_dropout=0.0, mlp_bias=False,
     bos_token_id=128000, eos_token_id=128001, pad_token_id=128004, use_cache=False,
 )
+if args.config_overrides:
+    import json
+    overrides = json.loads(args.config_overrides)
+    if "rope_scaling" in overrides and overrides["rope_scaling"] is None:
+        # transformers 5 keeps RoPE in rope_parameters (rope_theta included); None there breaks the model, so
+        # "no scaling" = plain RoPE with the same theta
+        overrides.pop("rope_scaling")
+        overrides["rope_parameters"] = {"rope_type": "default", "rope_theta": config.rope_parameters["rope_theta"]}
+    config.update(overrides)
+    print("Config overrides:", args.config_overrides)
 if args.seed is not None:
     set_seed(args.seed)  # the init draws from the global RNG; without --seed it is torch's fixed default seed
 assert args.packing == "concat" or args.attn_implementation.startswith("flash_attention"), "--packing doc needs FlashAttention varlen (--attn_implementation flash_attention_3)"
@@ -293,7 +335,10 @@ def doc_packing_collate(features):
 
 train_ds = TokenBlocks(os.path.join(DATA_DIR, "train.bin"), BLOCK_SIZE)
 val_ds = TokenBlocks(os.path.join(DATA_DIR, "val.bin"), BLOCK_SIZE)
-print(f"Train: {len(train_ds):,} blocks ({len(train_ds) * BLOCK_SIZE / 1e9:.2f}B tokens), val: {len(val_ds):,} blocks")
+# Our own dev set (select_rows.py dirs): evaluated next to val.bin, logged as eval/dev_loss, eval/dev_perplexity
+dev_ds = TokenBlocks(os.path.join(DATA_DIR, "dev.bin"), BLOCK_SIZE) if os.path.exists(os.path.join(DATA_DIR, "dev.bin")) else None
+print(f"Train: {len(train_ds):,} blocks ({len(train_ds) * BLOCK_SIZE / 1e9:.2f}B tokens), val: {len(val_ds):,} blocks"
+      + (f", dev: {len(dev_ds):,} blocks" if dev_ds is not None else ""))
 # One pass at most: the budget must not repeat tokens unintentionally (repeats would count against it anyway)
 assert tokens_seen(MAX_STEPS) <= len(train_ds) * BLOCK_SIZE, "train.bin has fewer tokens than the budget; raise --train_frac in prepare_data.py"
 
@@ -375,7 +420,7 @@ class DeadlineCallback(TrainerCallback):
 # same key: CustomTrainer.log adds total_tokens_seen to eval logs, and WandbCallback prefixes it "train/" (no eval_ prefix).
 # Runs after WandbCallback.on_train_begin (user callbacks come after the reporting ones), i.e. after wandb.init.
 TOKEN_AXIS_METRICS = ["train/loss", "train/ppl", "train/grad_norm", "train/learning_rate", "train/tokens_per_second",
-                      "train/mfu", "train/sophia_win_rate", "eval/loss", "eval/perplexity"]
+                      "train/mfu", "train/sophia_win_rate", "eval/loss", "eval/perplexity", "eval/dev_loss", "eval/dev_perplexity"]
 
 class WandbTokenAxisCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
@@ -454,8 +499,9 @@ elif args.optimizer == "muon":
     print(f"Muon: {len(muon_names)} tensors, {sum(n[k].numel() for k in muon_names) / 1e6:.1f}M params, lr {args.muon_lr}; "
           f"AdamW: {len(adamw_names)} tensors, {sum(n[k].numel() for k in adamw_names) / 1e6:.1f}M params, lr {args.learning_rate}")
 
-elif args.optimizer == "sophia":
-    assert args.fused_ce, "--optimizer sophia samples labels inside the fused CE forward; use --fused_ce"
+USES_SOPHIA = args.optimizer == "sophia" or (args.optimizer == "muonium" and args.muonium_rest == "sophia")
+if USES_SOPHIA:
+    assert args.fused_ce, "SophiaG samples labels inside the fused CE forward; use --fused_ce"
 
     def sophia_bs(step):  # official: step(bs=total_bs * block_size), tokens per step; follows --batch_ramp
         return batch_at(step) * BLOCK_SIZE
@@ -468,16 +514,76 @@ elif args.optimizer == "sophia":
             self.t += 1
             return super().step(closure, bs=sophia_bs(self.t))
 
-    # Same decay split as the HF Trainer's AdamW (matrices + embedding; not the RMSNorm weights)
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = SophiaGTrainer(
-        [{"params": [p for p in params if p.ndim >= 2], "weight_decay": args.weight_decay},
-         {"params": [p for p in params if p.ndim < 2], "weight_decay": 0.0}],
-        lr=args.learning_rate, betas=tuple(float(b) for b in args.sophia_betas.split(",")), rho=args.sophia_rho,
-        weight_decay=args.weight_decay,
-    )
-    print(f"SophiaG: lr {args.learning_rate}, rho {args.sophia_rho}, betas {args.sophia_betas}, wd {args.weight_decay}, "
-          f"bs {sophia_bs(1):,}{f' -> {sophia_bs(MAX_STEPS):,}' if RAMP else ''} tokens, Hessian every {args.sophia_hess_interval} steps")
+    def build_sophia(params):
+        # Same decay split as the HF Trainer's AdamW (matrices + embedding; not the RMSNorm weights)
+        opt = SophiaGTrainer(
+            [{"params": [p for p in params if p.ndim >= 2], "weight_decay": args.weight_decay},
+             {"params": [p for p in params if p.ndim < 2], "weight_decay": 0.0}],
+            lr=args.learning_rate, betas=tuple(float(b) for b in args.sophia_betas.split(",")), rho=args.sophia_rho,
+            weight_decay=args.weight_decay,
+        )
+        print(f"SophiaG: lr {args.learning_rate}, rho {args.sophia_rho}, betas {args.sophia_betas}, wd {args.weight_decay}, "
+              f"bs {sophia_bs(1):,}{f' -> {sophia_bs(MAX_STEPS):,}' if RAMP else ''} tokens, Hessian every {args.sophia_hess_interval} steps")
+        return opt
+
+
+class ChainedOptimizer(torch.optim.Optimizer):
+    """Several optimizers as one for the HF Trainer: exposes all their param groups (the same dicts, so the one LR
+    scheduler scales every group by the same factor, each from its own peak LR) and steps them all."""
+
+    def __init__(self, *opts):
+        self.opts = opts
+        super().__init__([p for o in opts for g in o.param_groups for p in g["params"]], {})
+        self.param_groups = [g for o in opts for g in o.param_groups]
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for o in self.opts:
+            o.step()
+        return loss
+
+    def zero_grad(self, set_to_none=True):
+        for o in self.opts:
+            o.zero_grad(set_to_none)
+
+    def state_dict(self):
+        return {str(i): o.state_dict() for i, o in enumerate(self.opts)}
+
+    def load_state_dict(self, state_dict):
+        for i, o in enumerate(self.opts):
+            o.load_state_dict(state_dict[str(i)])
+
+
+sophia_opt = None  # the SophiaG instance the Hessian callback updates
+
+if args.optimizer == "muonium":
+    # pip muonium (github.com/tonyf/muonium): Muon for 2D weights (momentum 0.95 Nesterov, Polar Express
+    # orthogonalization, LR x sqrt(max(1, rows/cols)), cautious decoupled wd) or NorMuon (--muonium_algorithm), and for
+    # the rest (as in its README: matrices except the tied embedding -> Muon) its fused AdamW (betas 0.9/0.95, eps 1e-8)
+    # or SophiaG (--muonium_rest). Muon LR --muon_lr, wd --muon_wd (default --weight_decay); the rest --learning_rate,
+    # --weight_decay. Package defaults: one lr 1e-3, wd 0.1 (the first run, muonium-default-1b, used --learning_rate for both).
+    from muonium import Muon
+    named = list(model.named_parameters())
+    muon_p = [p for n, p in named if p.ndim >= 2 and "embed" not in n]
+    rest_p = [p for n, p in named if p.ndim < 2 or "embed" in n]
+    muon_wd = args.weight_decay if args.muon_wd is None else args.muon_wd
+    muon_group = {"params": muon_p, "algorithm": args.muonium_algorithm}
+    if args.muonium_rest == "adamw":
+        optimizer = Muon([muon_group, {"params": rest_p, "algorithm": "adamw", "lr": args.learning_rate, "wd": args.weight_decay}],
+                         lr=args.muon_lr, wd=muon_wd)
+    else:
+        sophia_opt = build_sophia(rest_p)
+        optimizer = ChainedOptimizer(Muon([muon_group], lr=args.muon_lr, wd=muon_wd), sophia_opt)
+    print(f"muonium {args.muonium_algorithm}: {len(muon_p)} tensors, {sum(p.numel() for p in muon_p) / 1e6:.1f}M params, "
+          f"lr {args.muon_lr}, wd {muon_wd}; {args.muonium_rest}: {len(rest_p)} tensors, "
+          f"{sum(p.numel() for p in rest_p) / 1e6:.1f}M params, lr {args.learning_rate}, wd {args.weight_decay}")
+
+elif args.optimizer == "sophia":
+    sophia_opt = optimizer = build_sophia([p for p in model.parameters() if p.requires_grad])
 
 elif args.optimizer == "soap" and args.soap_impl == "meta":
     import distributed_shampoo as ds
@@ -533,12 +639,12 @@ class SophiaHessianCallback(TrainerCallback):
                 loss = ddp_model(**{k: v for k, v in inputs.items() if k != "labels"}, sample_labels=True).loss / len(batches)
                 loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args_.max_grad_norm)
-        optimizer.update_hessian()
+        sophia_opt.update_hessian()
         optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
             unclipped = sum((st["exp_avg"].abs() < args.sophia_rho * sophia_bs(state.global_step) * st["hessian"]).sum()
-                            for st in optimizer.state.values())
-            sophia_stats["sophia_win_rate"] = (unclipped / sum(st["exp_avg"].numel() for st in optimizer.state.values())).item()
+                            for st in sophia_opt.state.values())
+            sophia_stats["sophia_win_rate"] = (unclipped / sum(st["exp_avg"].numel() for st in sophia_opt.state.values())).item()
 
 # Trainer
 step_timer = StepTimerCallback()
@@ -601,7 +707,7 @@ class CustomTrainer(Trainer):
     step_batches, _batches_step = [], -1
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        if args.optimizer == "sophia":  # keep this optimizer step's micro-batches for the Hessian estimate
+        if USES_SOPHIA:  # keep this optimizer step's micro-batches for the Hessian estimate
             if self._batches_step != self.state.global_step:
                 self.step_batches, self._batches_step = [], self.state.global_step
             self.step_batches.append(inputs)
@@ -613,12 +719,24 @@ class CustomTrainer(Trainer):
             from accelerate.utils import DDPCommunicationHookType
             self.accelerator.ddp_handler.comm_hook = DDPCommunicationHookType.BF16  # registered when DDP wraps the model
 
+    def create_scheduler(self, num_training_steps, optimizer=None):
+        if args.lr_schedule == "wsd2" and self.lr_scheduler is None:
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer or self.optimizer, wsd2_lambda)
+            self._created_lr_scheduler = True
+        return super().create_scheduler(num_training_steps, optimizer)
+
     def get_train_dataloader(self):
         if RAMP is None:
             return super().get_train_dataloader()
         sampler = RampBatchSampler(len(self.train_dataset), RAMP, WORLD_SIZE, self.args.seed, GRAD_ACCUM)
         return self.accelerator.prepare(DataLoader(self.train_dataset, batch_sampler=sampler,
                                                    collate_fn=self.data_collator, pin_memory=True))
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+        if dev_ds is not None and eval_dataset is None and metric_key_prefix == "eval":
+            metrics.update(super().evaluate(dev_ds, ignore_keys, "eval_dev"))
+        return metrics
 
     # Lab metrics. WandbCallback prefixes train logs with "train/" and "eval_*" with "eval/": loss (mean over the
     # logging interval), grad_norm and learning_rate come from the Trainer; tokens_per_second (of the logging step
@@ -633,6 +751,9 @@ class CustomTrainer(Trainer):
         if "eval_loss" in logs:
             logs["total_tokens_seen"] = tokens_seen(self.state.global_step)  # x-axis for eval/perplexity vs tokens
             logs["eval_perplexity"] = math.exp(logs["eval_loss"])
+        if "eval_dev_loss" in logs:
+            logs["total_tokens_seen"] = tokens_seen(self.state.global_step)
+            logs["eval_dev_perplexity"] = math.exp(logs["eval_dev_loss"])
         super().log(logs, *args, **kwargs)
 
 
@@ -646,7 +767,7 @@ trainer = CustomTrainer(
     eval_dataset=val_ds,
     data_collator=doc_packing_collate if args.packing == "doc" else None,
     # Sophia's Hessian pass before step_timer, so its time counts in tokens_per_second / MFU
-    callbacks=([SophiaHessianCallback()] if args.optimizer == "sophia" else [])
+    callbacks=([SophiaHessianCallback()] if USES_SOPHIA else [])
     + [DeadlineCallback(deadline), step_timer, WandbTokenAxisCallback()]
     + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else []),
     optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
