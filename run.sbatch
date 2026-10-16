@@ -6,7 +6,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96  # 12 per GPU (partition max); 1 CPU slowed NCCL allreduce ~5x (GPT-2 profile 499745 vs 499746)
 #SBATCH --gpus-per-node=8
-#SBATCH --exclude=25a-hgpn001,25a-hgpn003,25a-hgpn157
+#SBATCH --exclude=25a-hgpn001,25a-hgpn003,25a-hgpn157,25a-hgpn173
 #SBATCH --time=8:00:00  # lab cap: 64 H200-hours per run = 8 GPUs x 8 h
 #SBATCH --output=logs/%x-%j.out
 
@@ -57,3 +57,4 @@ echo "========================================"
 # hgpn003 breaks multi-GPU jobs (jobs 493252, 493275, 493290)
 # hgpn001: both ranks land on the same GPU -> NCCL "Multiple Ranks are using the same GPU" (job 496208)
 # hgpn157: other processes held 137.7 GiB of each GPU -> OOM at startup (job 504613)
+# hgpn173: /work not writable -> torch.compile cache dir PermissionError at startup (job 554218)

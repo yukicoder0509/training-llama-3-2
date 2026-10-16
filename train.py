@@ -41,6 +41,10 @@ parser.add_argument("--block_size", type=int, default=8192, help="Context window
 parser.add_argument("--config_overrides", type=str, default=None, help='JSON dict applied to the Llama 3.2 1B config with config.update, e.g. a smaller model (train_scorer.py)')
 parser.add_argument("--global_batch_size", type=int, default=None, help="Sequences of 8192 tokens per optimizer step (per-GPU batch x grad accum x GPUs); 64 = 0.5M tokens. Default 64; giving it turns off the default --batch_ramp")
 parser.add_argument("--batch_ramp", type=str, default=None, help='Default "32:0.3333,64" (best run) unless --global_batch_size is given; "none" for a fixed batch. Global batch-size ramp "B1:t1,B2:t2,...,Bn": batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count ("32:1e9,64", or with a K/M/B suffix: "32:1B,64"), ti <= 1 a fraction of the token budget ("32:0.1,64"). Grad accum is fixed (enough for the largest Bi at --per_device_batch), so the micro-batch is Bi/(GPUs x accum); overrides --global_batch_size')
+parser.add_argument("--schedule_unit", type=str, default="steps", choices=["steps", "tokens"], help="--lr_schedule wsd: warmup / decay lengths in steps (fractions of the step count) or in tokens (fractions of --token_budget; the LR at a given token count then does not depend on the batch ramp, so runs that share a prefix can branch from a checkpoint)")
+parser.add_argument("--save_at_tokens", type=str, default=None, help='Save a full checkpoint (model, optimizer, scheduler, RNG) at the last step at or before each of these token counts, e.g. "100M,200M,333M": the steps where --batch_ramp=32:<count>,64 would switch. Into --ckpt_dir/checkpoint-<step>, linked as tokens-<count>')
+parser.add_argument("--ckpt_dir", type=str, default=None, help="Checkpoint dir (default /work/$USER/llama_ckpt/<run_name>)")
+parser.add_argument("--resume_from", type=str, default=None, help="Checkpoint to continue from (a --save_at_tokens checkpoint): restores model, optimizer, scheduler, RNG and the data position. The run's own flags (e.g. a different --batch_ramp after the branch point) apply from there")
 parser.add_argument("--per_device_batch", type=int, default=4, help="Max sequences per GPU per micro-batch; grad accum covers the rest")
 parser.add_argument("--fused_ce", action=argparse.BooleanOptionalAction, default=False, help="Liger fused LM head + cross-entropy: never materializes the full fp32 logits (128k vocab x 8192 tokens = 4 GiB per sequence). On in run.sbatch/profile.sbatch; --no-fused_ce disables")
 parser.add_argument("--attn_implementation", type=str, default="flash_attention_3", help="HF attention backend (default flash_attention_3: needed by --packing doc): sdpa (cuDNN flash), flash_attention_3 (Hub kernel kernels-community/vllm-flash-attn3 via `kernels`), flash_attention_4 (pip flash-attn-4, CuTe DSL)")
@@ -123,14 +127,16 @@ MAX_STEPS = args.max_steps or int(args.token_budget // (args.global_batch_size *
 # Batch-size ramp: list of (global batch, optimizer steps). Each stage gets its tokens (a count, or a fraction of the
 # budget), rounded down to whole steps, so the batch changes at the first step boundary at or before the stage's token
 # mark. The LR schedule (warmup / WSD decay) runs over the total optimizer steps, unchanged by the ramp.
+def stage_tokens(t):  # "1e9", "1B", "300M" -> tokens; <= 1 -> fraction of the budget
+    mult = {"K": 1e3, "M": 1e6, "B": 1e9}.get(t[-1].upper(), 1)
+    x = float(t[:-1] if mult != 1 else t) * mult
+    return x * args.token_budget if x <= 1 else x
+
+
 RAMP = None
 if args.batch_ramp:
     stages = [part.split(":") for part in args.batch_ramp.split(",")]
     sizes = [int(st[0]) for st in stages]
-    def stage_tokens(t):  # "1e9", "1B", "300M" -> tokens; <= 1 -> fraction of the budget
-        mult = {"K": 1e3, "M": 1e6, "B": 1e9}.get(t[-1].upper(), 1)
-        x = float(t[:-1] if mult != 1 else t) * mult
-        return x * args.token_budget if x <= 1 else x
     stage_toks = [stage_tokens(st[1]) for st in stages[:-1]]
     stage_toks.append(args.token_budget - sum(stage_toks))
     assert stage_toks[-1] > 0, f"--batch_ramp stages use {sum(stage_toks[:-1]):.3g} tokens, budget {args.token_budget:.3g}"
@@ -206,6 +212,22 @@ if RAMP is None:
 assert tokens_seen(MAX_STEPS) <= 6e9 or args.token_budget > 6e9, "over the 6B-token lab budget"
 WARMUP_STEPS = int(args.warmup_frac * MAX_STEPS)
 DECAY_STEPS = int(args.decay_frac * MAX_STEPS)
+if args.schedule_unit == "tokens":
+    assert args.lr_schedule == "wsd", "--schedule_unit tokens is implemented for --lr_schedule wsd"
+    # Warmup over warmup_frac x budget tokens, peak until (1 - decay_frac) x budget, then linear to 0 at the last step.
+    # Before the decay the LR depends only on tokens seen and the nominal budget, so the batch ramp can't change it.
+    WARMUP_TOKENS = args.warmup_frac * args.token_budget
+    DECAY_START = (1 - args.decay_frac) * args.token_budget
+    END_TOKENS = tokens_seen(MAX_STEPS)
+    print(f"WSD in tokens: warmup {WARMUP_TOKENS:,.0f}, decay from {DECAY_START:,.0f} to 0 at {END_TOKENS:,}")
+
+    def wsd_tokens_lambda(step):  # LR of optimizer step step + 1, from the tokens seen before it (as HF: step 0 -> 0)
+        t = tokens_seen(step)
+        if t < WARMUP_TOKENS:
+            return t / WARMUP_TOKENS
+        if t < DECAY_START:
+            return 1.0
+        return max(0.0, (END_TOKENS - t) / (END_TOKENS - DECAY_START))
 if args.lr_schedule == "wsd2":  # warmup | stable1 | decay1 to r | stable2 at r | decay to 0 (DECAY_STEPS)
     DECAY1_STEPS, STABLE2_STEPS = int(args.decay1_frac * MAX_STEPS), int(args.stable2_frac * MAX_STEPS)
     STABLE1_END = MAX_STEPS - DECAY_STEPS - STABLE2_STEPS - DECAY1_STEPS
@@ -355,9 +377,20 @@ print(f"Train: {len(train_ds):,} blocks ({len(train_ds) * BLOCK_SIZE / 1e9:.2f}B
 # One pass at most: the budget must not repeat tokens unintentionally (repeats would count against it anyway)
 assert tokens_seen(MAX_STEPS) <= len(train_ds) * BLOCK_SIZE, "train.bin has fewer tokens than the budget; raise --train_frac in prepare_data.py"
 
+CKPT_DIR = os.path.expanduser(args.ckpt_dir or os.path.join(os.path.expandvars("/work/$USER/llama_ckpt"), args.run_name or "latest"))
+# --save_at_tokens: step k with tokens_seen(k) <= mark < tokens_seen(k + 1), i.e. where a ramp stage of `mark` tokens ends
+SAVE_STEPS = {}
+if args.save_at_tokens:
+    for t in args.save_at_tokens.split(","):
+        mark = stage_tokens(t.strip())
+        k = max(s for s in range(MAX_STEPS + 1) if tokens_seen(s) <= mark)
+        assert 0 < k < MAX_STEPS, f"--save_at_tokens {t}: step {k} is outside the run"
+        SAVE_STEPS[k] = t.strip()
+    print("Checkpoints at steps:", ", ".join(f"{k} ({tokens_seen(k):,} tokens, mark {t})" for k, t in sorted(SAVE_STEPS.items())), "->", CKPT_DIR)
+
 # Training arg
 training_args = TrainingArguments(
-    output_dir=os.path.join("./results", args.run_name or ""),
+    output_dir=CKPT_DIR,  # only checkpoints (--save_at_tokens) are written here
     run_name=args.run_name,
     per_device_train_batch_size=PER_DEVICE_BATCH,
     per_device_eval_batch_size=PER_DEVICE_BATCH,
@@ -402,6 +435,26 @@ print("=== Training arguments: ", training_args)
 # a --time too short for the budget). Such a run saw fewer tokens and its LR decay was cut short, so it is not
 # comparable to others. It warns as early as step 50 if the projected finish is past the deadline, and records
 # budget_completed in the W&B summary (see the end of the script).
+class SaveAtTokensCallback(TrainerCallback):
+    """--save_at_tokens: a full checkpoint (Trainer._save_checkpoint: model, optimizer, scheduler, RNG, trainer state) at
+    SAVE_STEPS, then a tokens-<mark> link to it. save_strategy stays "no"; this sets should_save itself."""
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step in SAVE_STEPS:
+            control.should_save = True
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        mark = SAVE_STEPS.get(state.global_step)
+        if mark and state.is_world_process_zero:
+            link = os.path.join(CKPT_DIR, f"tokens-{mark}")
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(f"checkpoint-{state.global_step}", link)
+            print(f"=== checkpoint at step {state.global_step} ({tokens_seen(state.global_step):,} tokens) -> {link}")
+        return control
+
+
 class DeadlineCallback(TrainerCallback):
     PROJECT_AT = 50  # compile and warm-up are done by then
 
@@ -736,6 +789,9 @@ class CustomTrainer(Trainer):
         if args.lr_schedule == "wsd2" and self.lr_scheduler is None:
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer or self.optimizer, wsd2_lambda)
             self._created_lr_scheduler = True
+        if args.schedule_unit == "tokens" and self.lr_scheduler is None:
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer or self.optimizer, wsd_tokens_lambda)
+            self._created_lr_scheduler = True
         return super().create_scheduler(num_training_steps, optimizer)
 
     def get_train_dataloader(self):
@@ -781,14 +837,16 @@ trainer = CustomTrainer(
     data_collator=doc_packing_collate if args.packing == "doc" else None,
     # Sophia's Hessian pass before step_timer, so its time counts in tokens_per_second / MFU
     callbacks=([SophiaHessianCallback()] if USES_SOPHIA else [])
-    + [DeadlineCallback(deadline), step_timer, WandbTokenAxisCallback()]
+    + [DeadlineCallback(deadline), step_timer, WandbTokenAxisCallback()] + ([SaveAtTokensCallback()] if SAVE_STEPS else [])
     + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else []),
     optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
 )
 
 # Train
 print("=== Starting training...")
-trainer.train()
+if args.resume_from:
+    print(f"=== Resuming from {args.resume_from}")
+trainer.train(resume_from_checkpoint=args.resume_from)
 if args.eval and trainer.state.global_step % EVAL_STEPS:  # final eval unless the last step just ran one
     trainer.evaluate()
 BUDGET_COMPLETED = trainer.state.global_step >= MAX_STEPS

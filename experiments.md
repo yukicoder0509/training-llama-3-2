@@ -869,3 +869,38 @@ packing, `--batch_ramp=32:0.3333,64` (batch 32 for the first 1B tokens), 3B toke
   Muon LR 0.01, `--batch_ramp 32:0.3333,64`). Other optimizers keep their old LR defaults (6e-4; muon 1.25e-3).
   `--global_batch_size` or `--batch_ramp=none` turns the ramp off; train_scorer.py passes `--global_batch_size=256`, so
   the scorer / proxy runs are unchanged. profile.sbatch pins batch 64.
+
+## 2026-10-16 — When to double the batch: switch-point sweep by branching from checkpoints (1B tokens)
+
+Defaults (NorMuon 0.01, AdamW 3e-3, wd 0.1, doc packing), 1B tokens, `--schedule_unit tokens` (WSD warmup 20M tokens,
+decay from 900M: the LR depends only on tokens seen, so every ramp shares the batch-32 prefix). One batch-32 trunk saves
+full checkpoints (model, optimizer, scheduler, RNG, step) at each switch point; each branch resumes there with
+`--batch_ramp=32:<T>,64`. The trunk run to the end is the fixed-32 point. Tokens: trunk 1B + branches 3.2B (+ fixed 64
+1B) vs 7B for independent runs.
+
+Check first (174M scorer, 100M tokens, batch 128 → 256 at 30M): trunk A saved at step 114 (29.9M tokens), branch B
+resumed from it, reference C ran `128:30M,256` straight through. B vs C: final eval 4.445 vs 4.447, train loss within
+0.005 from 38M tokens on, identical LR. (C's first try died on hgpn173: /work not writable; node now excluded.)
+
+| Run (job) | Batch 32 for | Final eval loss (doc) |
+|---|---|---|
+| `ramp-sweep-fixed64-1b` (554165; step-unit WSD, same as tokens at a fixed batch) | 0 (fixed 64) | 2.991 |
+| `ramp-branch-at100M-1b` (554352) | 100M | 2.977 |
+| `ramp-branch-at200M-1b` (554353) | 200M | 2.968 |
+| `ramp-branch-at333M-1b` (554354) | 333M | 2.957 |
+| `ramp-branch-at500M-1b` (554355) | 500M | **2.945** |
+| `ramp-branch-at667M-1b` (554356) | 667M | **2.945** |
+| `ramp-trunk32-1b` (554351) | 1B (fixed 32) | 2.983 |
+
+Reference: `muonium-normuon0.01-adamw3e-3-ramp-1b` (333M, step-unit WSD) 2.941.
+
+- Later is better up to 500-667M (2.945, flat between them), −0.012 vs the current default switch at 333M and −0.046 vs
+  fixed 64. Batch 32 to the end (fixed 32) is 0.038 worse than 667M: the last third, which includes the decay, wants 64.
+- The 333M branch (2.957) is 0.016 worse than the step-unit run with the same ramp (2.941). Only the schedule differs:
+  step-unit WSD with the ramp has a 133M-token decay (10% of 2,542 steps, mostly at batch 64) and a 13M-token warmup;
+  token-unit has 100M and 20M. So a longer decay likely helps here; a `--decay_frac` sweep is the next branch to try
+  (it branches from one checkpoint at the decay start).
+- 1B-budget only: whether the best switch scales as a fraction of the budget (50-67%) or stays at ~0.5B tokens is not
+  tested. Cost: trunk 1:03 h + branches 0:56 / 0:52 / 0:46 / 0:37 / 0:30 (4:44 h of 8 GPUs) vs ~6.5 h for six
+  independent 1B runs (~1:05 each).
+- Checkpoints kept in /work/$USER/llama_ckpt/ramp-trunk32-1b (5 x 11 GB) for more branches.

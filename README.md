@@ -74,6 +74,9 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--warmup_frac` / `--decay_frac` | `0.02` / `0.1` | Linear warmup, then WSD with linear decay to 0 over the final fraction (0.1 as in MiniCPM; runs before 2026-10-14 used 0.2) |
 | `--lr_schedule` / `--min_lr_ratio` | `wsd` / `0.1` | `cosine`: cosine from the peak to `min_lr_ratio` × peak (Llama 2/3). `wsd2`: warmup, stable, decay to `--stable2_lr_ratio` × peak over `--decay1_frac`, stable for `--stable2_frac`, then decay to 0 over `--decay_frac` |
 | `--seed` | none | Init, data order and Sophia's label sampling (repeat-seed runs) |
+| `--schedule_unit` | `steps` | `tokens`: WSD warmup / decay as fractions of `--token_budget` tokens, so the LR at a token count doesn't depend on the batch ramp (needed to branch runs from a checkpoint) |
+| `--save_at_tokens` / `--ckpt_dir` | none / `/work/$USER/llama_ckpt/<run_name>` | Full checkpoints (model, optimizer, scheduler, RNG, step) at the last step at or before each token count (`100M,333M`), linked as `tokens-<count>` |
+| `--resume_from` | none | Continue from a checkpoint with this run's own flags (data order and LR continue where it stopped) |
 | `--adam_eps` | `1e-8` | Adam ε (Llama 2: 1e-5) |
 | `--optimizer` | `muonium` | `adamw` (fused torch AdamW), `adam_mini`, `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`), `muonium` (pip `muonium`, see below), `sophia` (SophiaG, `sophia.py` vendored from the official repo) or `soap` (see below); LR = `--learning_rate` |
 | `--muon_lr` / `--muon_momentum` | `0.01` (muonium), `1.25e-3` (muon) / `0.95` | Muon LR for the matrices; `--learning_rate` is then the AdamW (embedding, norms) LR. `muonium` scales by sqrt(max(1, rows/cols)): best 0.01 (experiments.md 2026-10-15) |
@@ -113,6 +116,17 @@ WSD 2% / 10%, doc packing, batch 32 for the first third of the tokens, then 64. 
 
 ```
 sbatch --time=5:00:00 run.sbatch --run_name=normuon-ramp-3b --token_budget=3e9
+```
+
+Branching instead of rerunning: runs that share a prefix (e.g. batch ramps that switch at different points) train
+the prefix once. The trunk saves checkpoints; each branch resumes with its own flags. Use token-unit WSD in all of
+them, and give the trunk the branches' micro-batch layout (here `--per_device_batch=2`: 2 x 2 accum x 8 GPUs = 32):
+
+```
+sbatch run.sbatch --run_name=trunk --token_budget=1e9 --schedule_unit=tokens --batch_ramp=32:0.5,32 --per_device_batch=2 \
+    --save_at_tokens=100M,333M --ckpt_dir=/work/$USER/llama_ckpt/trunk
+sbatch run.sbatch --run_name=at100M --token_budget=1e9 --schedule_unit=tokens --batch_ramp=32:100M,64 \
+    --resume_from=/work/$USER/llama_ckpt/trunk/tokens-100M
 ```
 
 Another `--optimizer` keeps its own LR defaults (6e-4; Muon 1.25e-3), not the muonium ones; the batch ramp still
