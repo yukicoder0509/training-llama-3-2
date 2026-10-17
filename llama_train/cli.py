@@ -55,11 +55,18 @@ def build_parser():
     parser.add_argument("--muonium_algorithm", type=str, default="normuon", choices=["muon", "normuon"], help="--optimizer muonium: update rule for the matrices (muon, or normuon: per-neuron second-moment normalization, muon_beta2 0.95)")
     parser.add_argument("--muonium_rest", type=str, default="adamw", choices=["adamw", "sophia"], help="--optimizer muonium: optimizer for the non-matrix params (tied embedding, norms) at --learning_rate / --weight_decay: muonium's AdamW, or SophiaG (--sophia_* flags, Hessian pass as in --optimizer sophia)")
     parser.add_argument("--muon_wd", type=float, default=None, help="--optimizer muonium: weight decay of the Muon matrices (default: --weight_decay)")
+    parser.add_argument("--norm_wd", action=argparse.BooleanOptionalAction, default=None, help="Weight decay on the 1-D params (RMSNorm weights) too, at the rate of their group. Default: on for muonium with --muonium_rest adamw (its AdamW group decays everything), off for the others (HF Trainer split: matrices + embedding only)")
     parser.add_argument("--muon_momentum", type=float, default=0.95, help="--optimizer muon: Muon Nesterov momentum")
     parser.add_argument("--data_dir", type=str, default=os.path.expandvars("/work/$USER/dolma3_llama"), help="Dir with train.bin and val.bin (uint32, prepare_data.py)")
     parser.add_argument("--seed", type=int, default=None, help="Seed for the init, data order and Sophia's label sampling (default: torch's fixed default RNG for the init, Trainer seed 42 for the rest; set it for repeat-seed runs)")
     parser.add_argument("--run_name", type=str, default=None, help="W&B run name; also isolates checkpoints in results/<run_name>")
     parser.add_argument("--save_dir", type=str, default=None, help="Where to save the final model + tokenizer (default: /work/$USER/llama_models/<run_name or latest>)")
+    parser.add_argument("--dyn_every", type=int, default=0, help="Optimizer dynamics (llama_train/optim_dynamics.py): measure per-block gradient / update / curvature / spectral metrics over a 2-step window every this many steps (0 = off). Rank 0 only")
+    parser.add_argument("--dyn_spectral_every", type=int, default=None, help="--dyn_every: spectral and effective-rank metrics every this many steps (a multiple of --dyn_every; default --dyn_every, 0 = never)")
+    parser.add_argument("--dyn_erank", action=argparse.BooleanOptionalAction, default=True, help="--dyn_every: effective rank of the update (full SVD of each matrix on spectral steps)")
+    parser.add_argument("--dyn_track_delta", action=argparse.BooleanOptionalAction, default=True, help="--dyn_every: also the effective rank of the accumulated change W_t - W_(t - dyn_every) (one more copy of the matrices)")
+    parser.add_argument("--dyn_out", type=str, default=None, help="--dyn_every: JSONL output (default <save_dir>/optim_dynamics.jsonl)")
+    parser.add_argument("--dyn_heatmap_every", type=int, default=10, help="--dyn_every: W&B (layer x block type) heatmap images every this many measurements (0 = none; per-layer values stay in the JSONL)")
     return parser
 
 
@@ -73,6 +80,8 @@ def parse_args(argv=None):
         args.learning_rate = 3e-3 if args.optimizer == "muonium" and args.muonium_rest == "adamw" else 6e-4
     if args.muon_lr is None:
         args.muon_lr = 0.01 if args.optimizer == "muonium" else 1.25e-3
+    if args.norm_wd is None:  # each optimizer's behavior before the flag existed
+        args.norm_wd = args.optimizer == "muonium" and args.muonium_rest == "adamw"
     if args.batch_ramp is None and args.global_batch_size is None:
         args.batch_ramp = "32:0.5,64"
     if args.batch_ramp and args.batch_ramp.lower() == "none":
@@ -91,4 +100,4 @@ def save_dir(args):
 
 
 def print_summary(args):
-    print("Model name:", args.model_name, "LR:", args.learning_rate, "Optimizer:", args.optimizer, *(["Muon LR:", args.muon_lr] if args.optimizer in ("muon", "muonium") else []), "WD:", args.weight_decay, "beta2:", args.beta2, "Run name:", args.run_name, "Packing:", args.packing, "Data dir:", data_dir(args))
+    print("Model name:", args.model_name, "LR:", args.learning_rate, "Optimizer:", args.optimizer, *(["Muon LR:", args.muon_lr] if args.optimizer in ("muon", "muonium") else []), "WD:", args.weight_decay, "norm WD:", args.norm_wd, "beta2:", args.beta2, "Run name:", args.run_name, "Packing:", args.packing, "Data dir:", data_dir(args))

@@ -21,6 +21,23 @@ from llama_train.optim import build_optimizer, uses_sophia
 from llama_train.trainer import CustomTrainer
 
 
+def optim_dynamics_callbacks(args, save_dir):
+    """--dyn_every: OptimDynamicsCallback on rank 0 (gradients are all-reduced and weights replicated under DDP, so the
+    other ranks would measure the same). JSONL at --dyn_out; W&B panels dyn_<metric>/<block type> on train/global_step."""
+    if not args.dyn_every or int(os.environ.get("RANK", 0)) != 0:
+        return []
+    from llama_train.optim_dynamics import OptimDynamicsCallback, make_wandb_log_fn
+    out = os.path.expanduser(args.dyn_out or os.path.join(save_dir, "optim_dynamics.jsonl"))
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if os.path.exists(out) and not args.resume_from:
+        os.remove(out)  # a fresh run starts a fresh log (the logger appends)
+    print(f"Optimizer dynamics every {args.dyn_every} steps (spectral every {args.dyn_spectral_every or args.dyn_every}) -> {out}")
+    return [OptimDynamicsCallback(
+        log_every=args.dyn_every, spectral_every=args.dyn_spectral_every, out_path=out, erank=args.dyn_erank,
+        track_delta=args.dyn_track_delta,
+        log_fn=make_wandb_log_fn(per_layer="heatmap" if args.dyn_heatmap_every else "none", heatmap_every=args.dyn_heatmap_every or 1))]
+
+
 def main(argv=None):
     start_time = time.time()
     print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)  # GPU check
@@ -102,7 +119,8 @@ def main(argv=None):
         callbacks=([sophia_cb] if sophia_cb else [])
         + [DeadlineCallback(deadline, start_time), step_timer, WandbTokenAxisCallback(args, plan)]
         + ([SaveAtTokensCallback(save_steps, ckpt_dir, plan)] if save_steps else [])
-        + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else []),
+        + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else [])
+        + optim_dynamics_callbacks(args, save_dir),
         optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
         cli_args=args, plan=plan, lr_lambda=lr_lambda, dev_dataset=dev_ds, step_timer=step_timer, extra_logs=sophia_stats,
         keep_step_batches=sophia_cb is not None,

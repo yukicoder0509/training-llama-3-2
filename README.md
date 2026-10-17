@@ -81,6 +81,7 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--optimizer` | `muonium` | `adamw` (fused torch AdamW), `adam_mini`, `muon` (Muon for decoder-layer matrices + AdamW for embeddings / norms, `muon_adamw.py`), `muonium` (pip `muonium`, see below), `sophia` (SophiaG, `sophia.py` vendored from the official repo) or `soap` (see below); LR = `--learning_rate` |
 | `--muon_lr` / `--muon_momentum` | `0.01` (muonium), `1.25e-3` (muon) / `0.95` | Muon LR for the matrices; `--learning_rate` is then the AdamW (embedding, norms) LR. `muonium` scales by sqrt(max(1, rows/cols)): best 0.01 (experiments.md 2026-10-15) |
 | `--muonium_algorithm` / `--muonium_rest` / `--muon_wd` | `normuon` / `adamw` / `--weight_decay` | `--optimizer muonium`: `normuon` adds per-neuron second-moment normalization; `--muonium_rest sophia` puts SophiaG on the embedding + norms |
+| `--norm_wd` / `--no-norm_wd` | on for muonium (AdamW rest), else off | Weight decay on the RMSNorm weights too (adamw, muonium, sophia, soap). Off is the HF Trainer split (matrices + embedding); muonium's AdamW group decayed everything, so on keeps the old runs' behavior |
 | `--soap_impl` / `--soap_betas` / `--soap_precond_freq` | `official` / `0.95,0.95` / `10` | SOAP (`--optimizer soap`, ε = `--adam_eps`). `official`: `soap.py` (paper authors) with the work split across GPUs by `soap_dist.py`. `meta`: facebookresearch `distributed_shampoo` (`--soap_block`, `--soap_comm_dtype`), no faster at the same preconditioner. +31% step time at 0.5M batch, +7% at 2M |
 | `--sophia_rho` / `--sophia_betas` / `--sophia_hess_interval` | `0.05` / `0.965,0.99` / `10` | SophiaG (official GPT-2 values). The Hessian pass every k steps reruns the step's batch with sampled labels: +1/k compute. Use weight decay ~2x AdamW's (0.2). Watch `train/sophia_win_rate` (official guidance: 0.1–0.5) |
 | `--ddp_find_unused` / `--ddp_bucket_cap_mb` / `--ddp_bf16_grads` | off / `200` / off | DDP settings (+6% vs Trainer's defaults of on / 25 MB); bf16 all-reduce gives no gain with large buckets |
@@ -92,6 +93,11 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--data_dir` | `/work/$USER/dolma3_llama` | `train.bin` / `val.bin`, plus `dev.bin` if present (our own dev set, logged as `eval/dev_loss`; see Data selection) |
 | `--block_size` / `--config_overrides` | `8192` / none | Context; JSON applied to the Llama 3.2 1B config (`train_scorer.py` uses both) |
 | `--save_dir` | `/work/$USER/llama_models/<run_name>` | Final model + tokenizer |
+| `--dyn_every` | `0` (off) | Optimizer dynamics (`llama_train/optim_dynamics.py`): per block type, layer and globally, every N steps over a 2-step window: gradient norm / cosine, update size / cosine / alignment with −g, directional sharpness and curvature, σ1, stable and effective rank of W, dW and the accumulated change. Rank 0; ~5 s per measurement on the proxy. Metric definitions: "Optimizer dynamics metrics" below |
+| `--dyn_spectral_every` | `--dyn_every` | Spectral / effective-rank metrics every N steps (full SVD per matrix) |
+| `--dyn_erank`, `--dyn_track_delta` | on | Effective rank of dW; effective rank of W_t − W_(t−N) (keeps one copy of the matrices) |
+| `--dyn_out` | `<save_dir>/optim_dynamics.jsonl` | One JSON line per measurement; W&B gets `dyn_<metric>/<block type>` on train/global_step |
+| `--dyn_heatmap_every` | `10` | W&B (layer x block type) heatmap images every N measurements (0: none) |
 
 Runs are bounded by the token budget: the step count comes from `--token_budget`, and a run ends when those steps are
 done. The Slurm time limit is only a safety net. Training stops 5 min before it (read from `squeue`) and still saves
@@ -132,6 +138,100 @@ sbatch run.sbatch --run_name=at100M --token_budget=1e9 --schedule_unit=tokens --
 
 Another `--optimizer` keeps its own LR defaults (6e-4; Muon 1.25e-3), not the muonium ones; the batch ramp still
 applies unless `--batch_ramp=none` or `--global_batch_size` is given.
+
+Compare runs' dynamics by stage (warmup / stable / decay) and block type with `analyze_dynamics.py`
+(`NAME=path/optim_dynamics.jsonl ...`): a plot per metric, layer heatmaps, and `summary.md` with stage medians.
+
+### Optimizer dynamics metrics (`--dyn_every N`)
+
+Every N steps the logger (`llama_train/optim_dynamics.py`) watches two consecutive optimizer steps, a = b − 1 and b
+(b is the logged step):
+
+| Symbol | Meaning |
+|---|---|
+| g_a, g_b | Gradients at steps a and b, after clipping (what the optimizer reads) |
+| v_a = W_after(a) − W_before(a) | The update the optimizer actually applied at step a, weight decay included. v_b likewise |
+| W | Weights at step b, before its update |
+| v̂ = v_a / ‖v_a‖ | Direction of the last update |
+
+Every value is computed for one group of tensors:
+- **Block types:** `embed` (tied with the LM head), `attn_q/k/v/o`, `mlp_gate/up/down`, `norm` (the RMSNorm weights).
+- **`global`:** the whole model.
+- **Per layer:** layer × block type.
+
+Norms, cosines and curvature are exact for the group: dot products are summed over its tensors, as if the group were
+one flattened vector (⟨x, y⟩ = Σ_tensors Σ_i x_i y_i), so `global` matches MiniCPM's whole-model definitions. Spectral
+metrics apply to 2-D tensors only (not `norm`) and are averaged over the group's matrices.
+
+On W&B, metric `m` of group `t` is `dyn_<m>/<t>` (e.g. `dyn_upd_rel/attn_q`, `dyn_grad_cos_prev/global`), plotted
+against `train/global_step`. More W&B outputs:
+- `dyn_lr/group<i>`: the LR of each optimizer param group.
+- `dyn_heatmap/<m>`: a (layer × block type) image every `--dyn_heatmap_every` measurements, for `upd_rel`,
+  `upd_cos_prev`, `grad_cos_prev` and `upd_srank`.
+
+The JSONL (`--dyn_out`) has every value, per layer included, under keys `global/<m>`, `type/<t>/<m>` and
+`layer/<LLL>/<t>/<m>`; load it with `load_dynamics()`.
+
+**Gradient**
+
+| `m` | Math | What it tells |
+|---|---|---|
+| `grad_norm`, `grad_max` | ‖g_b‖, max \|g_b\| | Gradient size per block. Spikes: instability; one block much larger than the others: imbalance |
+| `grad_cos_prev` | ⟨g_a, g_b⟩ / (‖g_a‖ ‖g_b‖) | Oscillation (see below) |
+
+How to read `grad_cos_prev`: on a quadratic with curvature λ along some direction, a step of size η gives
+g_b = (1 − ηλ) g_a.
+- < 0: ηλ > 1, the step overshoots and the iterate bounces across a sharp direction. Persistent values near −1 are
+  the edge of stability [Cohen+21, Cohen+22].
+- ≈ 0: gradient noise dominates.
+- \> 0: steady descent; the step is short compared with the curvature (the LR could go up).
+
+**Weights**
+
+| `m` | Math | What it tells |
+|---|---|---|
+| `w_norm` | ‖W‖_F | Weight growth. With decoupled decay, ‖W‖ settles after ~1/(ηλ) steps [Kosson+23, Wang & Aitchison 24]. If it is still rising at the end, the decay is too weak for the run length |
+| `w_sigma1` | σ₁(W): 6 power iterations, warm-started | Spectral norm: how much the layer can amplify its input. Growth here drives activation and logit growth (e.g. σ₁(W_q)·σ₁(W_k) bounds the attention logits) |
+| `w_srank` | ‖W‖_F² / σ₁(W)² | Stable rank [Rudelson & Vershynin 07]: how many directions hold the weight's energy. Low means a few spikes dominate |
+
+**Update**
+
+| `m` | Math | What it tells |
+|---|---|---|
+| `upd_norm`, `upd_rms`, `upd_max` | ‖v_a‖, ‖v_a‖/√n, max \|v_a\| | Absolute step. RMS ≈ the LR means a sign-like update (Adam's is ~0.2–0.4 × LR [Liu+25]) |
+| `upd_rel` | ‖v_a‖ / ‖W‖ | Relative step: the fraction of the weights changed per step. The most comparable step-size measure across optimizers and blocks |
+| `upd_cos_prev` | ⟨v_a, v_b⟩ / (‖v_a‖ ‖v_b‖) | Smoothness of consecutive updates (momentum). Lower: the update direction changes more from step to step |
+| `upd_grad_align` | ⟨v_a, −g_a⟩ / (‖v_a‖ ‖g_a‖) | 1 for plain SGD. Small values: momentum and the preconditioner turn the step away from the current gradient |
+| `upd_spec_rel` | σ₁(v_a) / σ₁(W) | Step size in spectral norm, the natural norm for a hidden-layer matrix [Bernstein & Newhouse 24] |
+| `upd_srank` | ‖v_a‖_F² / σ₁(v_a)² | Stable rank of the update |
+| `upd_erank`, `upd_erank_frac` | exp(−Σᵢ pᵢ log pᵢ), pᵢ = σᵢ²/Σⱼ σⱼ² (full SVD of v_a); `_frac` = erank / min(rows, cols) | Effective rank [Roy & Vetterli 07; this σ² variant: Huang+26, sec. 3.2]. 1/min(rows, cols) means rank 1, 1 means every singular direction gets an equal share |
+| `upd_row_cv` | std / mean over rows of ‖row_i(v_a)‖ | Variation across output neurons. High: a few neurons get most of the update (the imbalance NorMuon corrects [Li+25]) |
+| `delta_rel`, `delta_erank`, `delta_erank_frac` | The same, for D = W_b − W_(b−N), the change over the last N steps | Oscillating components cancel in D, so this measures the progress that sticks, not the per-step jitter |
+
+**Curvature along the update** (MiniCPM sec. 4.4 [Hu+24])
+
+| `m` | Math | What it tells |
+|---|---|---|
+| `D1` | ⟨g_b, v̂⟩ | Slope of the loss along the last step, measured after taking it. > 0: the step went past the 1-D minimum along v̂; < 0: still downhill |
+| `dir_sharpness` | ⟨g_b − g_a, v_a⟩ / ‖v_a‖² ≈ v̂ᵀ H v̂ | Hessian curvature along the update direction, by finite differences (g_b − g_a ≈ H v_a); MiniCPM's D2. Low: the optimizer steps in flat directions |
+| `curvature_K` | \|D2\| / (1 + D1²)^{3/2} | Curvature of the 1-D loss curve. Here D1² ≪ 1, so K ≈ \|dir_sharpness\| |
+
+Combining D1 and the sharpness: on a quadratic, the step length relative to the best step along v̂ is
+r = 1 + D1 / ⟨−g_a, v̂⟩, where ⟨−g_a, v̂⟩ = `upd_grad_align` × ‖g_a‖.
+- r = 1: an exact line search.
+- 1 < r < 2: overshoots, but the loss still drops along v̂.
+- r > 2: the loss rises along the step.
+
+**Caveats**
+- g_a and g_b come from different batches, so `D1` and `dir_sharpness` carry gradient noise of size about
+  ‖noise‖ / ‖v_a‖. Use medians over many measurements.
+- Ignore those two at the very end of the decay, where the LR is ~0 and the tiny update makes the noise term blow up.
+
+**Cost:** ~5 s per measurement on the proxy (mostly SVDs, the 128k × 768 embedding included): about +30% at
+`--dyn_every 50`. Use `--dyn_spectral_every 200`, or `--no-dyn_erank`, for routine runs.
+
+What these showed for AdamW vs Muon vs Sophia on the proxy, and which optimizer fits each stage and block:
+experiments.md 2026-10-17. References: list at the end of that entry.
 
 ## Data selection (small scoring model)
 
@@ -192,6 +292,7 @@ The pieces are in `llama_train/`:
 | `data.py` | `TokenBlocks` (uint32 token files in blocks), `DocPackingCollate` (`--packing doc`), train / val / dev sets |
 | `optim.py` | `build_optimizer`: Adam-mini, Muon, muonium, Sophia, SOAP (AdamW: the Trainer's own) |
 | `callbacks.py` | Checkpoints at token marks, Slurm deadline, W&B token axis, step time / MFU, Sophia's Hessian pass, profiler |
+| `optim_dynamics.py` | `OptimDynamicsLogger` / `OptimDynamicsCallback` (`--dyn_every`), `load_dynamics` for analysis |
 | `trainer.py` | `CustomTrainer`: LR schedule, ramp sampler, dev-set eval, bf16 DDP hook, lab metrics |
 
 Optimizer implementations stay at the top level (`muon_adamw.py`, `sophia.py`, `soap.py` / `soap_dist.py`).

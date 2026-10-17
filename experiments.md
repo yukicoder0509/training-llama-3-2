@@ -951,3 +951,247 @@ Checked against the pre-refactor commit 353b50b:
   under ~0.01 between single 1B 100M-token runs as ties.
 - Resume from the new code's 30M checkpoint (561393): 4.105 vs 4.106 uninterrupted. Scorer 50M: 5.795 old vs 5.800 new.
 - `test_packing.py` OK; `eval_packing.py` doc loss = in-training eval (4.0942 / 4.1056), via `DocPackingCollate` import.
+
+## 2026-10-17 — Optimizer dynamics on the proxy: AdamW vs Muon + AdamW vs Sophia (6B tokens)
+
+`train.py --dyn_every 50` (`llama_train/optim_dynamics.py`): every 50 steps, a 2-step window measures per block type /
+layer / globally the gradient, the applied update dW, curvature along dW, and the spectra / effective rank of W, dW and
+the 50-step change. 174M proxy (`train_scorer.py`), batch 256 x 2048 (0.5M tokens), WSD 2% / 10%, wd 0.1, 6B tokens
+(11,444 steps), one seed. Plots `plots/dyn/` (`analyze_dynamics.py`), stage medians `plots/dyn/summary.md`, JSONL in
+`/work/$USER/llama_models/proxy-dyn-*-6b/optim_dynamics.jsonl`.
+
+LRs from 1B-token sweeps (final eval loss; Muon + AdamW at 1B: 3.252):
+
+| AdamW LR | 5e-4 | **1e-3** | 2e-3 | 3e-3 | 6e-3 |
+|---|---|---|---|---|---|
+| eval | 3.529 | **3.406** | 3.406 | 3.429 | 6.522 |
+
+| Sophia LR / ρ | 5e-5 / .05 | 1e-4 / .05 | 2e-4 / .05 | 3e-4 / .05 | 6e-4 / .05 | 1.2e-3 / .05 | 1e-4 / .2 | 1e-4 / .01 | 1e-4 / .003 | **2e-4 / .01** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| eval | 3.851 | 3.617 | 3.665 | 3.661 | 5.65 | 7.04 | 3.798 | 3.599 | 3.582 | **3.566** |
+
+Sophia still improves toward smaller ρ / larger LR (toward sign-momentum), so it may be under-tuned by ~0.01-0.02.
+
+| Run (job) | Optimizer | Final eval loss |
+|---|---|---|
+| `proxy-dyn-muon-6b` (561805) | Muon 0.01 (layer matrices) + AdamW 3e-3 (embedding, norms) | **2.983** |
+| `proxy-dyn-adamw-6b` (561804) | AdamW 1e-3 | 3.018 |
+| `proxy-dyn-sophia-6b` (561908) | SophiaG 2e-4, ρ 0.01, Hessian every 10 (win rate 0.06 at the end) | 3.046 |
+
+(Muon run = `scorer-muon0.01-adamw3e-3-6b`'s setup, 2.986 without the logger.)
+
+Findings (stable-phase medians unless noted):
+- **Update rank.** Muon's updates to the layer matrices are near full rank from step ~100 on (effective rank 0.93-0.98
+  of the max; stable rank 175-550). AdamW and Sophia start with nearly rank-1 updates in warmup (erank 0.03-0.10) and
+  reach only 0.3-0.6 over thousands of steps; attn_q and attn_o get the lowest-rank updates under both (AdamW 0.33 /
+  0.27, Sophia 0.44 / 0.37). The accumulated 50-step change shows the same order (Muon 0.83, AdamW 0.57, Sophia 0.55).
+- **Oscillation.** Consecutive gradients are strongly anti-correlated under Muon (global grad cos −0.65 in stable,
+  −0.85 for norms): it steps across the valley at the edge of stability. Under AdamW the cosine is ≈ 0 (−0.04), under
+  Sophia positive (+0.34: steps too small to cross, consistent with its LR / ρ trend). The WSD decay removes Muon's
+  oscillation (cos → −0.24 median, ≈ +0.1 at the end), which is where its large decay-phase loss drop comes from.
+- **Step size and curvature.** Muon takes the largest relative steps (‖dW‖/‖W‖ 0.0057 vs AdamW 0.0039, Sophia 0.0023),
+  yet the curvature along its update direction is ~3x lower than AdamW's (directional sharpness 0.0038 vs 0.0126;
+  Sophia 0.0033): spreading the update over all singular directions avoids the sharp ones that AdamW's low-rank
+  updates line up with. attn_v and attn_o are the sharpest blocks under every optimizer.
+- **Alignment with −g** is low everywhere (momentum, normalization): AdamW 0.12, Muon 0.11 → 0.16 in decay, Sophia 0.05
+  (clipped, Hessian-scaled updates are nearly orthogonal to the gradient).
+- **Weight growth.** Muon keeps matrix spectra flattest: σ1 of the layer matrices saturates at 3-7 by step ~3000 and the
+  stable rank of W stays highest (global 112 vs AdamW 59, Sophia 44). Under Sophia the weights keep growing through the
+  decay (‖W‖ 1.1e3 → 1.4e3; mlp σ1 17-30 vs 5-10): its effective decay per step, LR x wd = 2e-5, is 1/5 of AdamW's (1e-4)
+  and 1/50 of Muon's (1e-3).
+- **Per layer.** AdamW and Sophia update some layers less (attn_o layers 8-9, attn_q layers 0-2: a band ~2x below the
+  rest); Muon's per-matrix normalization keeps update size uniform across layers.
+- **Confound: weight decay on the RMSNorm weights.** The HF Trainer's AdamW and our Sophia exclude norm weights from
+  decay; muonium's AdamW group (embedding + norms) decays them. In the Muon run the norm weights shrink 138 → 57 (‖·‖ over
+  all norms) while they stay ~125 under AdamW. This also holds for the 1B main runs (train.py default). Not tested
+  whether it helps or hurts.
+- Cost: ~5 s per measurement (SVDs, incl. the 128k x 768 embedding), 228 per run → mean step 0.33 s vs median 0.23 s,
+  ~19 min (≈30%) per 55-min run. `--dyn_every 100` or `--dyn_spectral_every 200` for routine use.
+
+Also: `CustomTrainer` replaced an empty shared `extra_logs` dict with a new one (`extra_logs or {}`), so Sophia's
+win rate was not logged since the refactor (the Hessian pass itself ran). Fixed.
+
+### Comparison: is Muon + AdamW the right choice, per stage and per block?
+
+Metric definitions: README, "Optimizer dynamics metrics". Values below are medians from `plots/dyn/summary.md`
+(stable phase unless noted). [refs] are listed at the end.
+
+**What each optimizer actually does here**
+
+- **AdamW** is close to sign descent with a per-coordinate step. Its update RMS is 0.19–0.21 × LR in every block,
+  the usual Adam ratio [Liu+25]. Viewed as steepest descent under the ℓ∞ norm [Bernstein & Newhouse 24], it follows
+  the gradient's dominant directions. Those are few: LM gradients are low rank [Zhao+24 GaLore]. Hence low-rank
+  updates (effective rank 0.27–0.58) and the highest curvature along the update.
+- **Muon** is steepest descent under the spectral norm [Jordan+24; Bernstein & Newhouse 24]. Orthogonalization gives
+  every singular direction of the momentum the same step, so updates are near full rank (0.93–0.98).
+  - In sharp directions it then overshoots: consecutive gradients are anti-correlated (cos −0.65).
+  - Most of the step's mass is in flat directions: sharpness along the update is 0.0038, against 0.0126 for AdamW.
+  - In the river-valley picture of WSD [Wen+24], this is high-LR progress along the river while bouncing between the
+    hill walls. The decay then removes the bounce (cos −0.65 → −0.24).
+- **Sophia** degenerated to sign momentum: almost every coordinate is clipped.
+  - Its win rate (unclipped share) ended at 0.06.
+  - Its update RMS is 1.93e-4 at LR 2e-4, i.e. 0.97 × LR. A clipped update is exactly ±LR, so this means nearly all
+    coordinates are clipped.
+  - So the Hessian estimate barely shapes the step. What is left is a conservative sign-of-momentum step (gradient
+    cos +0.34: steps too short).
+  - The LR / ρ sweep favored even smaller ρ, i.e. even more clipping. On this setup the curvature part didn't pay for
+    its +10% compute.
+  - This matches reports that Sophia's gains over a well-tuned AdamW mostly vanish under fair tuning [Kaddour+23;
+    Wen+25 Fantastic].
+- **Step length is not the difference.** On a quadratic, the step relative to the 1-D optimum along its own direction
+  is r ≈ 1 + D1 / (`upd_grad_align` · ‖g‖). From the global medians: AdamW 1.12, Muon 1.17, Sophia 1.13.
+  - All three sit just past the line-search optimum, so the LR sweeps did their job.
+  - The 0.035 / 0.063 eval gaps come from the update's direction and rank, not its length.
+
+**Is the choice optimal?** Among these three, yes, by a margin well above noise.
+- Gaps: Muon + AdamW 2.983 vs AdamW 3.018 (−0.035) vs Sophia 3.046 (−0.063). Same-seed noise is ~0.008.
+- Each optimizer had its LR tuned at 1B tokens, and runs were compared only at the end of the budget. Mid-run
+  rankings can flip during the LR decay [Wen+25 Fantastic].
+- The ranking agrees with the largest fair benchmark [Wen+25 Fantastic]: matrix-based optimizers (Muon, SOAP, Kron)
+  beat scalar ones (AdamW, Lion, Sophia, ...). Their speedup over AdamW shrinks with scale: ~1.4× at 0.1B, ~1.1× at
+  1.2B. So expect a smaller but still positive gain on the 1B main model.
+- That benchmark also finds Muon's lead strongest at low data-to-model ratios. The main run is ~0.25× Chinchilla
+  (6B tokens / 1.24B params), so it is in Muon's favorable regime.
+
+Not shown, so "optimal" is not established:
+- (a) Only 3 candidates. SOAP (`--optimizer soap`, +31% step time at 0.5M batch) is the strongest untested
+  alternative [Wen+25 Fantastic].
+- (b) Confound: weight decay on the norm weights is on only in the Muon run.
+- (c) One seed per optimizer.
+- (d) Sophia may be under-tuned by ~0.01–0.02. That would not close a 0.063 gap.
+
+**By stage**
+
+| Stage | Best fit | Evidence (AdamW / Muon / Sophia) |
+|---|---|---|
+| Warmup (2%, 228 steps) | **Muon** | Update effective rank 0.06 / 0.85 / 0.06: AdamW and Sophia spend warmup on nearly rank-1 updates. Muon's relative step is 2× larger (0.0105 vs 0.0049) at a lower sharpness than AdamW's (0.011 vs 0.050; attn_v 0.18 vs 2.3). Warmup exists to let sharpness fall before the LR peaks [Gilmer+21; Kalra & Barkeshli 24]. Muon starts flatter, so it may tolerate a shorter warmup (untested) |
+| Stable | **Muon** | Largest relative step (0.0057 / 0.0039 / 0.0023), 3× lower sharpness than AdamW, highest rank of the accumulated 50-step change (0.83 / 0.57 / 0.55): the most lasting progress per step. Its edge-of-stability bouncing is the intended high-LR regime of WSD [Wen+24] |
+| Decay | **Muon** (keep it; nothing points to switching) | The bounce is mostly gone (grad cos −0.24 / +0.17 / +0.41), and alignment with −g rises (0.16 / 0.14 / 0.04). The next lever is decay length, not the optimizer: river-valley theory [Wen+24] and our switch-point sweeps (2026-10-16) both say a longer decay helps, so `--decay_frac` comes first. An AdamW / SOAP decay could be tested by branching at the decay start, but the optimizer state would not carry over |
+
+**By block**
+
+| Block | Best fit | Evidence |
+|---|---|---|
+| attn_q, attn_k | **Muon** | AdamW's updates to attn_q have low rank (0.33; Sophia 0.44; Muon 0.92). The cost: Muon grows attn_k more (σ₁ 7.0 vs AdamW 4.1). The rough logit bound σ₁(q)·σ₁(k) (medians over layers) is AdamW 28, Muon 44, Sophia 53. Fine at this scale; at large scale Muon needed QK-Clip [Kimi K2 25]. Watch `dyn_w_sigma1/attn_k` on the 1B model |
+| attn_v, attn_o | **Muon** | The sharpest blocks under every optimizer. Muon halves their sharpness (v 0.040 vs 0.083, o 0.016 vs 0.032), and AdamW's attn_o updates have the lowest rank of any block (0.27). AdamW and Sophia also show a band of layers with ~2× smaller attn_o updates |
+| mlp_gate, mlp_up, mlp_down | **Muon → NorMuon** | Rank 0.98 vs 0.54–0.58; lower sharpness. Muon's per-neuron update norms vary (row CV 0.09–0.10 on gate / up), the imbalance NorMuon removes with per-row normalization after orthogonalization [Li+25]. The 1B main model already uses NorMuon (`--muonium_algorithm normuon`); the proxy used plain Muon |
+| embed / LM head (tied) | **AdamW** | Orthogonalization is derived for hidden matrices; the embedding's input is one-hot, and its rows (tokens) get very uneven gradients by frequency (row CV 0.54–0.58). Adam's per-coordinate scale compensates. Muon's authors and Moonlight keep embeddings and the head on AdamW [Jordan+24; Liu+25]. Zhao+24 (Deconstructing) find that adaptivity matters most for exactly the last layer and the norm parameters |
+| RMSNorm weights | **AdamW, likely without weight decay** | Vectors: Muon does not apply. muonium decays them (norm gains 1.0 → 0.41 on average; ‖·‖ 138 → 57), while the HF / Sophia runs exclude 1-D params from decay. A pre-matmul RMSNorm gain can be folded into the next matrix (a scale symmetry), so decaying it mainly moves scale into matrices that Muon decays anyway. Untested: next experiment |
+
+**Weight decay timescale** explains the weight-growth differences. With decoupled decay, weights settle after about
+τ = 1/(LR·λ) steps [Kosson+23]. Wang & Aitchison 24 argue that τ should be set as a fraction of the run length.
+
+| Optimizer | τ (steps) | Fraction of the 11,444-step run | ‖W‖ stable → decay |
+|---|---|---|---|
+| Muon (layer matrices; gate / up get LR × 1.63) | 1,000 (610 for gate / up) | < 0.1 | 1.08e3 → 1.06e3: settled; layer σ₁ flat from step ~3000 |
+| AdamW | 10,000 | 0.87 | 645 → 712: still growing |
+| Sophia | 50,000 | 4.4 | 1.1e3 → 1.43e3: growing fast |
+
+Sophia's wd should be ~5–10× higher at this LR (its paper uses 0.2 at a 3× larger LR [Liu+23]). AdamW's 0.1 is at
+the edge.
+
+**Next, in order of expected value:**
+1. Muon proxy run without norm weight decay. It needs a muonium option to exclude 1-D params.
+2. `--decay_frac` sweep, branched from one checkpoint.
+3. SOAP on the proxy at 6B, matched for wall-clock time.
+
+Sophia is not worth more tuning here.
+
+**References**
+- [Bernstein & Newhouse 24] J. Bernstein, L. Newhouse. Old Optimizer, New Norm: An Anthology. arXiv:2409.20325.
+- [Cohen+21] J. Cohen et al. Gradient Descent on Neural Networks Typically Occurs at the Edge of Stability. ICLR 2021, arXiv:2103.00065.
+- [Cohen+22] J. Cohen et al. Adaptive Gradient Methods at the Edge of Stability. arXiv:2207.14484.
+- [Gilmer+21] J. Gilmer et al. A Loss Curvature Perspective on Training Instability in Deep Learning. arXiv:2110.04369.
+- [Hu+24] S. Hu et al. MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies. arXiv:2404.06395 (WSD; D1 / D2 in sec. 4.4).
+- [Huang+26] Huang et al. Mechanism-Driven Monitors for Preemptive Detection of LLM Training Instability. arXiv:2606.28116 (effective rank of dW; cited in `optim_dynamics.py`).
+- [Jordan+24] K. Jordan et al. Muon: An optimizer for hidden layers in neural networks. Blog, 2024, kellerjordan.github.io/posts/muon.
+- [Kaddour+23] J. Kaddour et al. No Train No Gain: Revisiting Efficient Training Algorithms for Transformer-based Language Models. NeurIPS 2023, arXiv:2307.06440.
+- [Kalra & Barkeshli 24] D. Kalra, M. Barkeshli. Why Warmup the Learning Rate? Underlying Mechanisms and Improvements. arXiv:2406.09405.
+- [Kimi K2 25] Kimi Team. Kimi K2: Open Agentic Intelligence. arXiv:2507.20534 (MuonClip / QK-Clip).
+- [Kosson+23] A. Kosson et al. Rotational Equilibrium: How Weight Decay Balances Learning Across Neural Networks. arXiv:2305.17212.
+- [Li+25] Z. Li et al. NorMuon: Making Muon more efficient and scalable. arXiv:2510.05491.
+- [Liu+23] H. Liu et al. Sophia: A Scalable Stochastic Second-order Optimizer for Language Model Pre-training. arXiv:2305.14342.
+- [Liu+25] J. Liu et al. (Moonshot AI). Muon is Scalable for LLM Training. arXiv:2502.16982.
+- [Roy & Vetterli 07] O. Roy, M. Vetterli. The effective rank: A measure of effective dimensionality. EUSIPCO 2007.
+- [Rudelson & Vershynin 07] M. Rudelson, R. Vershynin. Sampling from large matrices: an approach through geometric functional analysis. J. ACM 2007 (stable rank).
+- [Wang & Aitchison 24] X. Wang, L. Aitchison. How to set AdamW's weight decay as you scale model and dataset size. arXiv:2405.13698.
+- [Wen+24] K. Wen et al. Understanding Warmup-Stable-Decay Learning Rates: A River Valley Loss Landscape Perspective. arXiv:2410.05192.
+- [Wen+25 Fantastic] K. Wen, D. Hall, T. Ma, P. Liang. Fantastic Pretraining Optimizers and Where to Find Them. ICLR 2026, arXiv:2509.02046.
+- [Zhao+24 GaLore] J. Zhao et al. GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection. arXiv:2403.03507.
+- [Zhao+24 Deconstructing] R. Zhao et al. Deconstructing What Makes a Good Optimizer for Language Models. arXiv:2407.07972.
+
+## 2026-10-17 — Proxy: Sophia retuned for win rate, SOAP, and weight decay on the norm weights (6B tokens)
+
+New flag `--norm_wd` / `--no-norm_wd`: weight decay on the RMSNorm weights for adamw, muonium, sophia and soap. The
+defaults keep the old behavior: on for muonium (its AdamW group decayed everything), off for the rest. Same proxy
+setup as the entry above: `--dyn_every 50`, one seed, plots `plots/dyn2/` (8 runs), stage medians
+`plots/dyn2/summary.md`.
+
+**Sophia, retuned for the win rate.** Target: ~0.23–0.24 at 2B tokens, the best region on the 1B main model
+(2026-10-08/09). wd 0.2 as on the 1B model (the earlier proxy runs used 0.1). Sweep at a 2B budget; final eval loss
+(final win rate):
+
+| LR \ ρ | 0.02 | 0.03 | 0.05 | 0.1 |
+|---|---|---|---|---|
+| 1e-4 | 3.302 (.24) | | 3.341 (.48) | 3.384 (.70) |
+| 2e-4 | 3.285 (.17) | | **3.276 (.35)** | 3.314 (.56) |
+| 3e-4 | 3.291 (.14) | 3.294 (.19) | 3.279 (.28) | 3.302 (.47) |
+| 4e-4 | | 3.340 (.17) | 3.329 (.25) | 3.377 (.41) |
+| 5e-4 / 6e-4 | | | 3.778 (.43) at 5e-4 | 4.336 (.67) at 6e-4 |
+
+- **What sets the win rate.** At a fixed LR it rises with ρ. At a fixed ρ it falls as LR rises, until the LR is too
+  high (≥ 4e-4), where it rises again as training degrades.
+- **Best region.** The best runs end at a win rate of 0.28–0.35 (ρ 0.05, LR 2e-4 / 3e-4). The runs at 0.24–0.25
+  are 0.03–0.05 worse: one has the LR too low (1e-4 / ρ 0.02), the other too high (4e-4 / ρ 0.05).
+  - So the proxy's best is a little above the 1B model's 0.23–0.24. The win rate is a guide, not a target: it only
+    says something once the LR is in the stable range.
+- **Usable LRs.** As on the 1B model, the usable LR has a cliff, here between 3e-4 and 5e-4.
+- **Missing control.** The old proxy setting (2e-4, ρ 0.01, wd 0.1) was not rerun at 2B, so the sweep has no direct
+  control.
+
+**SOAP** (`--optimizer soap`, official `soap.py` via `soap_dist.py`, betas 0.95 / 0.95, preconditioner every 10 steps,
+wd 0.1; vocab dim not preconditioned). LR sweep at 1B (Muon + AdamW at 1B: 3.252):
+
+| LR | 1e-3 | 2e-3 | **4e-3** | 6e-3 | 8e-3 |
+|---|---|---|---|---|---|
+| eval | 3.278 | 3.250 | **3.247** | 3.260 | 3.273 |
+
+**6B results** (final eval loss; runs 561804, 561805 and 561908 are from the entry above):
+
+| Optimizer | Norm wd off | Norm wd on | On − off |
+|---|---|---|---|
+| Muon 0.01 + AdamW 3e-3 | 2.987 (563001) | **2.983** (561805, default) | −0.004 |
+| SOAP 4e-3 | 2.989 (563154) | 2.985 (563152) | −0.004 |
+| AdamW 1e-3 | 3.018 (561804) | 3.014 (563002) | −0.004 |
+| Sophia 2e-4, ρ 0.05, wd 0.2 (retuned) | 3.049 (563153; win rate 0.28 at the end) | 3.052 (563151) | +0.003 |
+| Sophia 2e-4, ρ 0.01, wd 0.1 (old) | 3.046 (561908) | — | |
+
+Each run has one seed; same-seed noise is ~0.008 on the 1B model at 100M tokens, unmeasured here.
+
+Findings:
+- **Norm weight decay: no detectable effect.** Every on/off difference is ≤ 0.004, below the noise.
+  - Three of four lean toward "on", so if there is an effect, it is tiny.
+  - The decay clearly acts on the norms (stable median ‖norm weights‖, init 138): Muon 111 → 58, AdamW 130 → 90,
+    SOAP 91 → 36, Sophia 121 → 102. The rest of the model barely moves: weight norms, update rank and sharpness of
+    the matrices change by a few %.
+  - Consistent with the scale symmetry: a pre-matmul RMSNorm gain can be absorbed into the next matrix. Keep the
+    default (on for muonium), and no change is needed for the 1B model.
+- **SOAP ties Muon** (2.985–2.989 vs 2.983–2.987), and both beat AdamW by ~0.03.
+  - On the proxy it costs only ~2% more time per step (median 0.248–0.250 s vs 0.243 s for Muon; 768-dim matrices
+    are cheap to precondition). On the 1B model it was +31% at a 0.5M batch, so Muon stays the better choice there.
+  - **Its dynamics differ from Muon's:**
+
+    | Metric (stable phase) | SOAP | Muon | AdamW |
+    |---|---|---|---|
+    | Directional sharpness | **0.0011** (lowest of all) | 0.0038 | 0.0126 |
+    | Gradient cosine | +0.13 (no oscillation) | −0.65 | |
+    | Update effective rank | 0.69 | 0.96 | 0.46 |
+
+    SOAP reaches the same loss by stepping into flat directions without oscillating, where Muon bounces across the
+    valley. So the edge-of-stability bouncing isn't needed for Muon's result.
+  - Its weights grow the most: ‖W‖ 1.58e3; σ₁ of mlp_down 15–17 vs Muon's 4.6.
+- **Sophia: retuning didn't help at 6B.** 3.049 vs 3.046 for the old setting, and the win rate at the end is now 0.28
+  instead of 0.06. Sophia stays ~0.03 behind AdamW and ~0.065 behind Muon / SOAP.
+  - With a well-tuned win rate, the Hessian scaling still adds nothing over sign-momentum here.
+  - Its +10% compute (Hessian every 10 steps) makes it the worst choice of the four on the proxy.
+- Cost: 6 runs × 1:05–1:14 h, 17 sweep runs × 10–20 min (8 GPUs each).

@@ -20,7 +20,8 @@ class CustomTrainer(Trainer):
         optimizer step's micro-batches (Sophia's Hessian pass)."""
         # set before Trainer.__init__, which calls create_accelerator_and_postprocess
         self.cli_args, self.plan, self.lr_lambda, self.dev_dataset = cli_args, plan, lr_lambda, dev_dataset
-        self.step_timer, self.extra_logs, self.keep_step_batches = step_timer, extra_logs or {}, keep_step_batches
+        self.step_timer, self.keep_step_batches = step_timer, keep_step_batches
+        self.extra_logs = {} if extra_logs is None else extra_logs  # the same dict the Sophia callback writes
         super().__init__(*a, **kw)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
