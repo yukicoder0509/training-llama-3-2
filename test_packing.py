@@ -2,12 +2,11 @@
 
     sbatch --gpus-per-node=1 --cpus-per-task=12 --time=0:15:00 --wrap="source .venv/bin/activate && python test_packing.py"
 
-Runs train.py's doc_packing_collate (extracted from its source) on val.bin blocks, through a random-init Llama 3.2 1B
+Runs train.py's doc packing collate (llama_train.data.DocPackingCollate) on val.bin blocks, through a random-init Llama 3.2 1B
 with FlashAttention 3, and compares per-token losses with separate per-segment forwards (and with --packing concat,
 which must differ after the first document).
 """
 
-import ast
 import os
 
 import numpy as np
@@ -15,17 +14,15 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, LlamaConfig
 
+from llama_train.data import DocPackingCollate
+
 BLOCK_SIZE = 8192
-src = open(os.path.join(os.path.dirname(__file__), "train.py")).read()
-fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "doc_packing_collate")
 config = LlamaConfig(
     vocab_size=128256, hidden_size=2048, intermediate_size=8192, num_hidden_layers=4, num_attention_heads=32,
     num_key_value_heads=8, max_position_embeddings=131072, rope_theta=500000.0, bos_token_id=128000, eos_token_id=128001,
     rope_scaling={"rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
                   "original_max_position_embeddings": 8192}, use_cache=False)
-ns = {"torch": torch, "BOS_ID": config.bos_token_id, "BLOCK_SIZE": BLOCK_SIZE}
-exec(compile(ast.Module([fn], []), "train.py", "exec"), ns)
-collate = ns["doc_packing_collate"]
+collate = DocPackingCollate(config.bos_token_id, BLOCK_SIZE)
 
 torch.manual_seed(0)
 model = AutoModelForCausalLM.from_config(config, attn_implementation="flash_attention_3", torch_dtype=torch.bfloat16).cuda().eval()

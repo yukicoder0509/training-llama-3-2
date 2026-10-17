@@ -7,7 +7,6 @@ doc: each document attends only to itself, positions restart at <|begin_of_text|
 documents one by one). Same tokens and targets in both: the mean CE over every next-token prediction in the blocks.
 """
 
-import ast
 import os
 import sys
 
@@ -16,12 +15,10 @@ import torch
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 from transformers import AutoModelForCausalLM
 
+from llama_train.data import DocPackingCollate
+
 BLOCK_SIZE = 8192
-src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py")).read()
-fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "doc_packing_collate")
-ns = {"torch": torch, "BOS_ID": 128000, "BLOCK_SIZE": BLOCK_SIZE}
-exec(compile(ast.Module([fn], []), "train.py", "exec"), ns)
-collate = ns["doc_packing_collate"]
+collate = DocPackingCollate(128000, BLOCK_SIZE)
 
 tokens = np.memmap(os.path.expandvars("/work/$USER/dolma3_llama/val.bin"), dtype=np.uint32, mode="r")
 n_blocks = len(tokens) // BLOCK_SIZE

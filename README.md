@@ -178,3 +178,23 @@ python push_model.py --model_dir /work/$USER/llama_models/my-run --repo_id $MODE
 ```
 
 This uploads the model, config, and tokenizer. Then set `eval_model_id` in the OJ script.
+
+## Code layout
+
+`train.py` is the entry point (`main(argv)`; `run.sbatch` launches it, `train_scorer.py` calls it with its defaults).
+The pieces are in `llama_train/`:
+
+| Module | Contents |
+|---|---|
+| `cli.py` | All flags, and the defaults that depend on other flags (muonium LRs, the default batch ramp) |
+| `plan.py` | `Plan`: steps, batch ramp, `batch_at` / `tokens_seen`; `RampBatchSampler`; LR schedules (`hf_schedule`, and `lr_lambda` for wsd2 / `--schedule_unit tokens`); `--save_at_tokens` steps. No GPU needed |
+| `model.py` | Llama 3.2 1B config and init, Liger fused LM head + loss, per-layer `torch.compile` |
+| `data.py` | `TokenBlocks` (uint32 token files in blocks), `DocPackingCollate` (`--packing doc`), train / val / dev sets |
+| `optim.py` | `build_optimizer`: Adam-mini, Muon, muonium, Sophia, SOAP (AdamW: the Trainer's own) |
+| `callbacks.py` | Checkpoints at token marks, Slurm deadline, W&B token axis, step time / MFU, Sophia's Hessian pass, profiler |
+| `trainer.py` | `CustomTrainer`: LR schedule, ramp sampler, dev-set eval, bf16 DDP hook, lab metrics |
+
+Optimizer implementations stay at the top level (`muon_adamw.py`, `sophia.py`, `soap.py` / `soap_dist.py`).
+`tests/plan_dump.py` prints the plan (per-step batch, tokens, LR) for 9 flag sets on the CPU; after a change to
+`cli.py` / `plan.py`, diff its output against the previous commit's (`--impl old --src <old train.py>` reads a
+pre-refactor `train.py`).

@@ -14,7 +14,6 @@ Any train.py flag given on the command line overrides these defaults (argparse k
 
 import json
 import os
-import runpy
 import sys
 
 SCORER_CONFIG = dict(
@@ -41,6 +40,6 @@ os.environ["WANDB_PROJECT"] = "llama3.2-arch-small-scoring-model"
 cli = sys.argv[1:]
 if cli and cli[0].startswith("--model_name="):
     cli = cli[1:]
-train_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py")
-sys.argv = [train_py, *DEFAULTS, *cli]
-runpy.run_path(train_py, run_name="__main__")
+if __name__ == "__main__":
+    from train import main
+    main([*DEFAULTS, *cli])

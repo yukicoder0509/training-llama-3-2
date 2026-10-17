@@ -930,3 +930,24 @@ Reference: `muonium-normuon0.01-adamw3e-3-ramp-3b` (552056; switch at 1B, step-u
   60M in token units. The decay length matters more than the switch point; `--decay_frac` is the next sweep.
 - Cost: trunk 2:13 h + branches 1:59 / 1:38 / 1:16 / 0:54 / 0:32 (8:32 h of 8 GPUs) vs ~13 h for five independent runs.
 - Checkpoints in /work/$USER/llama_ckpt/ramp-trunk32-3b (5 x 11 GB).
+
+## 2026-10-17 — train.py split into llama_train/ (no behavior change); same-seed run-to-run noise
+
+`train.py` (872 lines) → `main()` + `llama_train/{cli,plan,model,data,optim,callbacks,trainer}.py` (README: Code layout).
+Checked against the pre-refactor commit 353b50b:
+- `tests/plan_dump.py`: per-step batch, tokens seen and LR factor, plus the printed plan lines, for 9 flag sets (default
+  6B / 3B, token-unit trunk + branch, wsd2, fixed batch + `--save_at_tokens`, cosine, `--max_steps` ramp, scorer):
+  byte-identical (52,689 lines).
+- W&B config of a 1B 100M-token `--seed 0` run (all flags, derived plan, TrainingArguments; 226 keys): identical.
+- The same run, twice per version (doc eval loss at 100M):
+
+| Code | Run 1 | Run 2 |
+|---|---|---|
+| old (353b50b) | 4.094 (561387) | 4.102 (561520) |
+| new | 4.106 (561392) | 4.098 (561521) |
+
+  Same code and seed differ by 0.008 at the end (first eval 8.49-8.77): training is not bitwise reproducible (FA3 /
+  compiled kernels, NCCL reduction order), so old vs new (means 4.098 / 4.102) is within noise. Treat differences
+  under ~0.01 between single 1B 100M-token runs as ties.
+- Resume from the new code's 30M checkpoint (561393): 4.105 vs 4.106 uninterrupted. Scorer 50M: 5.795 old vs 5.800 new.
+- `test_packing.py` OK; `eval_packing.py` doc loss = in-training eval (4.0942 / 4.1056), via `DocPackingCollate` import.
