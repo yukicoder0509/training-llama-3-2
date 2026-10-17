@@ -69,7 +69,7 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--token_budget` | `6e9` | Training tokens; steps = budget / (global batch x 8192). No padding, so every token counts |
 | `--global_batch_size` | `64` | Sequences per step (64 x 8192 = 0.5M tokens). Giving it turns off the default ramp |
 | `--per_device_batch` | `4` | Max sequences per GPU per micro-batch; grad accum covers the rest |
-| `--batch_ramp` | `32:0.3333,64` | `none` for a fixed batch. `"B1:t1,...,Bn"`: batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count (`32:1e9,64`, or `32:1B,64` / `32:333M,64`): the switch is at the same tokens for any budget. ti ≤ 1 is a fraction of the budget (`32:0.3333,64`: 333M of 1B, 1B of 3B). Switches at the last whole step within the stage; LRs and the LR schedule are unchanged. Overrides `--global_batch_size` |
+| `--batch_ramp` | `32:0.5,64` | `none` for a fixed batch. `"B1:t1,...,Bn"`: batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count (`32:1e9,64`, or `32:1B,64` / `32:333M,64`): the switch is at the same tokens for any budget. ti ≤ 1 is a fraction of the budget (`32:0.3333,64`: 333M of 1B, 1B of 3B). Switches at the last whole step within the stage; LRs and the LR schedule are unchanged. Overrides `--global_batch_size` |
 | `--learning_rate` / `--weight_decay` / `--beta2` | `3e-3` (muonium), else `6e-4` / `0.1` / `0.95` | Peak LR; with muon / muonium the AdamW (embedding, norms) part |
 | `--warmup_frac` / `--decay_frac` | `0.02` / `0.1` | Linear warmup, then WSD with linear decay to 0 over the final fraction (0.1 as in MiniCPM; runs before 2026-10-14 used 0.2) |
 | `--lr_schedule` / `--min_lr_ratio` | `wsd` / `0.1` | `cosine`: cosine from the peak to `min_lr_ratio` × peak (Llama 2/3). `wsd2`: warmup, stable, decay to `--stable2_lr_ratio` × peak over `--decay1_frac`, stable for `--stable2_frac`, then decay to 0 over `--decay_frac` |
@@ -111,8 +111,9 @@ python plot_runs.py dvqj42sv dkyqsbe6 --out plots/wsd_vs_cosine_1h.png   # train
 ```
 
 The defaults are the best run so far, `muonium-normuon0.01-adamw3e-3-ramp-3b` (doc eval ppl 15.1 at 3B tokens,
-experiments.md 2026-10-16): NorMuon LR 0.01 on the decoder-layer matrices, AdamW 3e-3 on the embedding + norms, wd 0.1,
-WSD 2% / 10%, doc packing, batch 32 for the first third of the tokens, then 64. So it is just
+experiments.md 2026-10-16), except the batch switch: NorMuon LR 0.01 on the decoder-layer matrices, AdamW 3e-3 on the embedding + norms, wd 0.1,
+WSD 2% / 10%, doc packing, batch 32 for the first half of the tokens, then 64 (that run switched at a third; the switch-point sweeps at 1B and
+3B put the best at half the budget). So it is just
 
 ```
 sbatch --time=5:00:00 run.sbatch --run_name=normuon-ramp-3b --token_budget=3e9

@@ -40,7 +40,7 @@ parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2 for bo
 parser.add_argument("--block_size", type=int, default=8192, help="Context window / training block (8192 = DESCRIPTION.md; train_scorer.py: 2048)")
 parser.add_argument("--config_overrides", type=str, default=None, help='JSON dict applied to the Llama 3.2 1B config with config.update, e.g. a smaller model (train_scorer.py)')
 parser.add_argument("--global_batch_size", type=int, default=None, help="Sequences of 8192 tokens per optimizer step (per-GPU batch x grad accum x GPUs); 64 = 0.5M tokens. Default 64; giving it turns off the default --batch_ramp")
-parser.add_argument("--batch_ramp", type=str, default=None, help='Default "32:0.3333,64" (best run) unless --global_batch_size is given; "none" for a fixed batch. Global batch-size ramp "B1:t1,B2:t2,...,Bn": batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count ("32:1e9,64", or with a K/M/B suffix: "32:1B,64"), ti <= 1 a fraction of the token budget ("32:0.1,64"). Grad accum is fixed (enough for the largest Bi at --per_device_batch), so the micro-batch is Bi/(GPUs x accum); overrides --global_batch_size')
+parser.add_argument("--batch_ramp", type=str, default=None, help='Default "32:0.5,64" (switch-point sweeps at 1B and 3B) unless --global_batch_size is given; "none" for a fixed batch. Global batch-size ramp "B1:t1,B2:t2,...,Bn": batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count ("32:1e9,64", or with a K/M/B suffix: "32:1B,64"), ti <= 1 a fraction of the token budget ("32:0.1,64"). Grad accum is fixed (enough for the largest Bi at --per_device_batch), so the micro-batch is Bi/(GPUs x accum); overrides --global_batch_size')
 parser.add_argument("--schedule_unit", type=str, default="steps", choices=["steps", "tokens"], help="--lr_schedule wsd: warmup / decay lengths in steps (fractions of the step count) or in tokens (fractions of --token_budget; the LR at a given token count then does not depend on the batch ramp, so runs that share a prefix can branch from a checkpoint)")
 parser.add_argument("--save_at_tokens", type=str, default=None, help='Save a full checkpoint (model, optimizer, scheduler, RNG) at the last step at or before each of these token counts, e.g. "100M,200M,333M": the steps where --batch_ramp=32:<count>,64 would switch. Into --ckpt_dir/checkpoint-<step>, linked as tokens-<count>')
 parser.add_argument("--ckpt_dir", type=str, default=None, help="Checkpoint dir (default /work/$USER/llama_ckpt/<run_name>)")
@@ -87,7 +87,7 @@ if args.learning_rate is None:
 if args.muon_lr is None:
     args.muon_lr = 0.01 if args.optimizer == "muonium" else 1.25e-3
 if args.batch_ramp is None and args.global_batch_size is None:
-    args.batch_ramp = "32:0.3333,64"
+    args.batch_ramp = "32:0.5,64"
 if args.batch_ramp and args.batch_ramp.lower() == "none":
     args.batch_ramp = None
 if args.global_batch_size is None:

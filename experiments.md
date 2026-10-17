@@ -904,3 +904,29 @@ Reference: `muonium-normuon0.01-adamw3e-3-ramp-1b` (333M, step-unit WSD) 2.941.
   tested. Cost: trunk 1:03 h + branches 0:56 / 0:52 / 0:46 / 0:37 / 0:30 (4:44 h of 8 GPUs) vs ~6.5 h for six
   independent 1B runs (~1:05 each).
 - Checkpoints kept in /work/$USER/llama_ckpt/ramp-trunk32-1b (5 x 11 GB) for more branches.
+
+## 2026-10-16 — Switch-point sweep at 3B tokens: the switch scales as a fraction of the budget
+
+Same method as the 1B sweep, budget 3e9, token-unit WSD (warmup 60M, decay 2.7B → 3B). Trunk `ramp-trunk32-3b`
+(555967, batch 32, `--per_device_batch=2`) saved at 0.5/1/1.5/2/2.5B and was cancelled after the last one; each branch
+`ramp-branch-at<T>-3b` resumes with `--batch_ramp=32:<T>,64` and runs to 3B.
+
+| Run (job) | Batch 32 for | Fraction | Final eval loss (doc) |
+|---|---|---|---|
+| `ramp-branch-at500M-3b` (556126) | 0.5B | 0.17 | 2.737 |
+| `ramp-branch-at1B-3b` (556257) | 1B | 0.33 | 2.731 |
+| `ramp-branch-at1.5B-3b` (556462) | 1.5B | 0.50 | **2.728** |
+| `ramp-branch-at2B-3b` (556638) | 2B | 0.67 | 2.730 |
+| `ramp-branch-at2.5B-3b` (556708) | 2.5B | 0.83 | 2.745 |
+
+Reference: `muonium-normuon0.01-adamw3e-3-ramp-3b` (552056; switch at 1B, step-unit WSD) 2.714.
+
+- Fraction, not a fixed count: the 1B sweep's optimum (0.5-0.67B) would put the 3B best at 0.5B if it were a fixed token
+  count, but 0.5B is 0.009 worse than the best. The best is at 0.5 of the budget, as at 1B (0.5-0.67), and the curve is
+  flat from 0.33 to 0.67 (within 0.003). Switching very late (0.83) costs 0.017. For 6B: switch at ~3B (`32:0.5,64`).
+- The flat region widens with budget: 0.33 costs 0.012 at 1B but 0.003 at 3B.
+- All branches lose to 552056 (2.714), and the 1B branch has the same ramp: the 0.017 gap is the schedule, as at 1B (0.016).
+  Step-unit WSD with this ramp gives a 400M-token decay (10% of the steps, all at batch 64) and 40M warmup vs 300M and
+  60M in token units. The decay length matters more than the switch point; `--decay_frac` is the next sweep.
+- Cost: trunk 2:13 h + branches 1:59 / 1:38 / 1:16 / 0:54 / 0:32 (8:32 h of 8 GPUs) vs ~13 h for five independent runs.
+- Checkpoints in /work/$USER/llama_ckpt/ramp-trunk32-3b (5 x 11 GB).
