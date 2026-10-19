@@ -53,6 +53,59 @@ class ChainedOptimizer(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         for i, o in enumerate(self.opts):
             o.load_state_dict(state_dict[str(i)])
+        # torch's load_state_dict gives each optimizer new param-group dicts: relink, or the LR scheduler (and the
+        # dynamics logger) would keep writing the old ones. accelerate calls this at prepare() (device placement), so
+        # before this fix every chained run trained at a constant LR (no warmup, no decay) while logging the schedule.
+        self.param_groups = [g for o in self.opts for g in o.param_groups]
+
+
+def muon_head_groups(args, config, muon_named):
+    """muonium groups for the hidden matrices. Default: one group at --muon_lr. --muon_split_heads kv / qkv: k_proj and
+    v_proj (and q_proj) in their own group, orthogonalized per attention head (muonium split_sizes: row blocks of
+    head_dim). --muon_lr_mult_kv: k_proj / v_proj in their own group at muon_lr x mult."""
+    alg = args.muonium_algorithm
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    kv_own = args.muon_split_heads in ("kv", "qkv") or args.muon_lr_mult_kv != 1
+    is_q = lambda n: args.muon_split_heads == "qkv" and "q_proj" in n
+    is_kv = lambda n: kv_own and ("k_proj" in n or "v_proj" in n)
+
+    def head_split(ps):
+        rows = {p.shape[0] for p in ps}
+        assert len(rows) == 1 and next(iter(rows)) % head_dim == 0, f"head split: rows {rows}, head_dim {head_dim}"
+        return (head_dim,) * (next(iter(rows)) // head_dim)
+
+    groups = [{"params": [p for n, p in muon_named if not is_q(n) and not is_kv(n)], "algorithm": alg}]
+    q_p = [p for n, p in muon_named if is_q(n)]
+    if q_p:
+        groups.append({"params": q_p, "algorithm": alg, "split_sizes": head_split(q_p)})
+    kv_p = [p for n, p in muon_named if is_kv(n)]
+    if kv_p:
+        kv = {"params": kv_p, "algorithm": alg}
+        if args.muon_split_heads != "none":
+            kv["split_sizes"] = head_split(kv_p)
+        if args.muon_lr_mult_kv != 1:
+            kv["lr"] = args.muon_lr * args.muon_lr_mult_kv
+        groups.append(kv)
+    return groups
+
+
+def param_group_table(optimizer, named):
+    """One row per param group (index as in the dynamics logger's lr/group<i>): algorithm, lr, wd, split_sizes, sizes and
+    example names. Printed at startup."""
+    names = {id(p): n for n, p in named}
+    rows = []
+    for i, g in enumerate(optimizer.param_groups):
+        ps = g["params"]
+        ex = sorted({names[id(p)].split(".")[-2] if names[id(p)].count(".") >= 2 else names[id(p)] for p in ps})
+        rows.append({"group": i, "algorithm": g.get("algorithm", "soap" if "precondition_frequency" in g else "?"),
+                     "lr": g["lr"], "wd": g.get("wd", g.get("weight_decay")), "split_sizes": g.get("split_sizes"),
+                     "tensors": len(ps), "params": sum(p.numel() for p in ps), "examples": ",".join(ex[:4])})
+    print("Param groups:\n  group | algorithm | lr | wd | split_sizes | tensors | params | examples")
+    for r in rows:
+        split = f"({r['split_sizes'][0]},)x{len(r['split_sizes'])}" if r["split_sizes"] else "-"
+        print(f"  {r['group']} | {r['algorithm']} | {r['lr']:g} | {r['wd']:g} | {split} | {r['tensors']} | "
+              f"{r['params'] / 1e6:.2f}M | {r['examples']}")
+    return rows
 
 
 def build_sophia(args, plan, params):
@@ -117,18 +170,29 @@ def build_optimizer(args, model, config, plan, training_args):
         muon_p = [p for n, p in named if p.ndim >= 2 and "embed" not in n]
         rest_p = [p for n, p in named if p.ndim < 2 or "embed" in n]
         muon_wd = args.weight_decay if args.muon_wd is None else args.muon_wd
-        muon_group = {"params": muon_p, "algorithm": args.muonium_algorithm}
+        muon_groups = muon_head_groups(args, config, [(n, p) for n, p in named if p.ndim >= 2 and "embed" not in n])
         if args.muonium_rest == "adamw":
             adamw = dict(algorithm="adamw", lr=args.learning_rate)
-            optimizer = Muon([muon_group, {"params": [p for p in rest_p if p.ndim >= 2], "wd": args.weight_decay, **adamw},
-                              {"params": [p for p in rest_p if p.ndim < 2], "wd": norm_wd(args), **adamw}],
-                             lr=args.muon_lr, wd=muon_wd)
+            embed_p = [p for p in rest_p if p.ndim >= 2]
+            norms = {"params": [p for p in rest_p if p.ndim < 2], "wd": norm_wd(args), **adamw}
+            if args.norm_lr is not None:
+                norms["lr"] = args.norm_lr
+            if args.embed_optimizer == "soap":  # the tied embedding on SOAP (--learning_rate), the rest in muonium
+                optimizer = ChainedOptimizer(Muon([*muon_groups, norms], lr=args.muon_lr, wd=muon_wd), DistributedSOAP(
+                    [{"params": embed_p, "weight_decay": args.weight_decay}], lr=args.learning_rate,
+                    betas=tuple(float(b) for b in args.soap_betas.split(",")), eps=args.adam_eps, weight_decay=args.weight_decay,
+                    precondition_frequency=args.soap_precond_freq, max_precond_dim=args.soap_max_precond_dim))
+            else:
+                optimizer = Muon([*muon_groups, {"params": embed_p, "wd": args.weight_decay, **adamw}, norms],
+                                 lr=args.muon_lr, wd=muon_wd)
         else:
+            assert args.norm_lr is None and args.embed_optimizer == "adamw", "--norm_lr / --embed_optimizer need --muonium_rest adamw"
             sophia_opt = build_sophia(args, plan, rest_p)
-            optimizer = ChainedOptimizer(Muon([muon_group], lr=args.muon_lr, wd=muon_wd), sophia_opt)
+            optimizer = ChainedOptimizer(Muon(muon_groups, lr=args.muon_lr, wd=muon_wd), sophia_opt)
         print(f"muonium {args.muonium_algorithm}: {len(muon_p)} tensors, {sum(p.numel() for p in muon_p) / 1e6:.1f}M params, "
               f"lr {args.muon_lr}, wd {muon_wd}; {args.muonium_rest}: {len(rest_p)} tensors, "
               f"{sum(p.numel() for p in rest_p) / 1e6:.1f}M params, lr {args.learning_rate}, wd {args.weight_decay} (norms {norm_wd(args)})")
+        args.param_groups = param_group_table(optimizer, named)  # in the W&B config with the other args
 
     elif args.optimizer == "adamw" and args.norm_wd:
         # The Trainer's adamw_torch_fused, but decaying the RMSNorm weights too (the model has no biases)
@@ -173,8 +237,8 @@ def build_optimizer(args, model, config, plan, training_args):
              {"params": [p for p in params if p.ndim < 2], "weight_decay": norm_wd(args)}],
             lr=args.learning_rate, betas=tuple(float(b) for b in args.soap_betas.split(",")), eps=args.adam_eps,
             weight_decay=args.weight_decay, precondition_frequency=args.soap_precond_freq,
-            max_precond_dim=args.soap_max_precond_dim,
+            max_precond_dim=args.soap_max_precond_dim, precondition_1d=args.soap_precondition_1d,
         )
         print(f"SOAP: lr {args.learning_rate}, betas {args.soap_betas}, eps {args.adam_eps}, wd {args.weight_decay} (norms {norm_wd(args)}), "
-              f"precondition every {args.soap_precond_freq} steps, max dim {args.soap_max_precond_dim}")
+              f"precondition every {args.soap_precond_freq} steps, max dim {args.soap_max_precond_dim}, precondition 1-D {args.soap_precondition_1d}")
     return optimizer, sophia_opt

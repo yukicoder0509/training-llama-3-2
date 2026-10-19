@@ -8,6 +8,8 @@ Stages from the WSD schedule (--warmup_frac / --decay_frac of --max_steps): warm
   <out>/<metric>.png        one panel per run, a line per block type (y log-scale for magnitudes), stages shaded
   <out>/layers_<metric>_<type>.png   layer x step heatmaps, one row per run
   <out>/summary.md          medians per stage, run and block type for every metric
+  <out>/phases.md           medians over step windows (--gate, stable, decay) incl. overshoot D1/grad_norm and the
+                            fraction of D1 > 0, deltas vs --baseline; with --logs NAME=slurm.out (one per run) also eval losses
 """
 
 import argparse
@@ -40,6 +42,12 @@ ap.add_argument("--out", default="plots/dyn")
 ap.add_argument("--max_steps", type=int, default=11444, help="Run length in steps (stages; 6B proxy: 11,444)")
 ap.add_argument("--warmup_frac", type=float, default=0.02)
 ap.add_argument("--decay_frac", type=float, default=0.1)
+ap.add_argument("--gate", default="500:1500", help="phases.md: 'gate' window lo:hi in steps (mechanism checks)")
+ap.add_argument("--stable_from", type=int, default=500, help="phases.md: the stable window runs from here to decay start - 50")
+ap.add_argument("--baseline", default=None, help="phases.md: run NAME to subtract")
+ap.add_argument("--logs", action="append", default=[], help="NAME=slurm log for eval losses (phases.md); repeat per run")
+ap.add_argument("--tokens_per_step", type=int, default=262144, help="eval steps from tokens (proxy: 262144 at batch 128, 524288 at 256)")
+ap.add_argument("--noise", type=float, default=0.004, help="flag |final − baseline| below this")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 
@@ -147,4 +155,88 @@ for metric, _ in METRICS:
         cells = [fmt(m.loc[blk].get(r, {}).get(s) if s in m.loc[blk].index else None) for r in runs for s in ("warmup", "stable", "decay")]
         lines.append(f"| {blk} | " + " | ".join(cells) + " |")
 open(os.path.join(a.out, "summary.md"), "w").write("\n".join(lines) + "\n")
+
+# 4. phases.md: medians over fixed step windows (gate / stable / decay), overshoot D1 / grad_norm and the fraction of
+# D1 > 0, deltas vs --baseline, and eval losses from the Slurm logs. dir_sharpness / curvature_K are left out on purpose:
+# both carry a batch-noise bias ~ 1/LR (they rise in the decay for that reason alone).
+g0, g1 = (int(x) for x in a.gate.split(":"))
+windows = {"gate": (g0, g1), "stable": (a.stable_from, decay_start - 50), "decay": (decay_start + 1, a.max_steps)}
+PHASE_METRICS = ["grad_cos_prev", "overshoot_norm", "overshoot", "upd_grad_align", "D1>0", "upd_rel", "upd_row_cv", "upd_erank_frac", "delta_erank_frac", "w_srank"]
+
+
+def phase_values(df):
+    """(metric, block, window) -> median; overshoot = D1 / grad_norm per measurement, D1>0 = fraction of measurements."""
+    sub = df[df.scope.isin(["type", "global"])].copy()
+    sub["block"] = np.where(sub.scope == "global", "global", sub.type)
+    wide = sub.pivot_table(index=["block", "step"], columns="metric", values="value")
+    if "D1" in wide and "grad_norm" in wide:
+        wide["overshoot"] = wide["D1"] / wide["grad_norm"]
+        if "upd_grad_align" in wide:  # D1 / grad_norm is cos(g_next, update): it also rises when the update follows -g
+            wide["overshoot_norm"] = wide["overshoot"] / wide["upd_grad_align"]  # more closely; normalize by alignment
+        wide["D1>0"] = (wide["D1"] > 0).astype(float).where(wide["D1"].notna())
+    out = {}
+    steps = wide.index.get_level_values("step")
+    for w, (lo, hi) in windows.items():
+        part = wide[(steps >= lo) & (steps <= hi)]
+        agg = part.groupby(level="block").agg(lambda s: s.mean() if s.name == "D1>0" else s.median())
+        for m in PHASE_METRICS:
+            if m in agg:
+                for blk, v in agg[m].items():
+                    out[(m, blk, w)] = v
+    return out
+
+
+def evals(path):
+    """[(step, eval_loss)] from a train.py Slurm log; steps from total_tokens_seen / --tokens_per_step."""
+    import re
+    seen = {}
+    for m in re.finditer(r"'eval_loss': '([0-9.]+)'.{0,300}?'total_tokens_seen': ([0-9]+)", open(path, errors="replace").read()):
+        seen[round(int(m.group(2)) / a.tokens_per_step)] = float(m.group(1))
+    return sorted(seen.items())
+
+
+pv = {name: phase_values(df) for name, df in runs.items()}
+base = a.baseline
+plines = [f"# Optimizer dynamics by phase\n",
+          f"Windows (steps): " + ", ".join(f"{w} {lo}-{hi}" for w, (lo, hi) in windows.items())
+          + f". Medians, except D1>0 (fraction of measurements). overshoot = D1 / grad_norm = cos(next gradient, update) "
+          f"(> 0: the step went past the line minimum); it grows with the update's alignment to -g too, so compare "
+          f"overshoot_norm = overshoot / upd_grad_align. Use global metrics for gates: oscillation is a whole-network "
+          f"property. Baseline: {base or 'none'}.\n"]
+logs = dict(s.split("=", 1) for s in a.logs)
+if logs:
+    plines += ["\n## Eval loss\n", "| run | final | pre-decay (step) | decay gain | final − baseline |", "|---|---|---|---|---|"]
+    ev = {n: evals(p) for n, p in logs.items()}
+    fin = {n: e[-1][1] for n, e in ev.items() if e}
+    for n, e in ev.items():
+        if not e:
+            plines.append(f"| {n} | no evals | | | |")
+            continue
+        pre = [x for x in e if x[0] <= decay_start]
+        pre_s, pre_v = pre[-1] if pre else (None, float("nan"))
+        d = "" if base not in fin or n == base else f"{fin[n] - fin[base]:+.4f}" + (" (< noise)" if abs(fin[n] - fin[base]) < a.noise else "")
+        plines.append(f"| {n} | {fin[n]:.4f} | {pre_v:.4f} ({pre_s}) | {pre_v - fin[n]:.4f} | {d} |")
+blocks = ["global"] + types_seen
+for m in PHASE_METRICS:
+    if not any(k[0] == m for v in pv.values() for k in v):
+        continue
+    plines += [f"\n## {m}\n", "| block | " + " | ".join(f"{r} {w}" for r in runs for w in windows) + " |",
+               "|---|" + "---|" * (len(runs) * len(windows))]
+    for blk in blocks:
+        cells = [fmt(pv[r].get((m, blk, w))) for r in runs for w in windows]
+        if any(cells):
+            plines.append(f"| {blk} | " + " | ".join(cells) + " |")
+    if base in pv and len(runs) > 1:
+        others = [r for r in runs if r != base]
+        plines += [f"\nΔ vs {base}:\n", "| block | " + " | ".join(f"{r} {w}" for r in others for w in windows) + " |",
+                   "|---|" + "---|" * (len(others) * len(windows))]
+        for blk in blocks:
+            cells = []
+            for r in others:
+                for w in windows:
+                    x, b = pv[r].get((m, blk, w)), pv[base].get((m, blk, w))
+                    cells.append("" if x is None or b is None else f"{x - b:+.3g}")
+            if any(cells):
+                plines.append(f"| {blk} | " + " | ".join(cells) + " |")
+open(os.path.join(a.out, "phases.md"), "w").write("\n".join(plines) + "\n")
 print("wrote", a.out)

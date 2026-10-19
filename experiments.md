@@ -622,6 +622,10 @@ embedding + norms (263M). 0.5M batch, doc packing, 1,907 steps, 8 H200. The firs
 - **Sophia in place of AdamW for embedding + norms hurts: 3.159 vs 3.055** (+0.10), and halves throughput
   (2.1e5 vs 4.2e5 tok/s: Hessian re-forwards plus the slower path). Curves track until ~0.75B, then the AdamW hybrid
   gains much more in the decay. Keep NorMuon + AdamW.
+  - **Invalid (found 2026-10-18):** this run used `ChainedOptimizer`, which before the fix trained at a constant LR
+    (no warmup, no decay) while logging the schedule: accelerate's `prepare()` round-trips the optimizer through
+    `load_state_dict`, which gave the inner optimizers new param-group dicts that the scheduler never saw. That explains
+    "tracks until the decay, then falls behind". The Sophia hybrid is untested; see the 2026-10-18 Stage A entry.
 
 ## 2026-10-15 — How much does the original train.bin repeat? (`repetition.py`, job 547494, 52 s)
 
@@ -1195,3 +1199,198 @@ Findings:
   - With a well-tuned win rate, the Hessian scaling still adds nothing over sign-momentum here.
   - Its +10% compute (Hessian every 10 steps) makes it the worst choice of the four on the proxy.
 - Cost: 6 runs × 1:05–1:14 h, 17 sweep runs × 10–20 min (8 GPUs each).
+
+## 2026-10-18 — Proxy at 1B tokens and half the batch: does the 6B picture hold in the 1B model's data regime?
+
+**Why.** The 1B model at 6B tokens sees ~5 tokens per parameter, the 174M proxy at 6B ~34. At 6B the proxy has nearly
+converged and the optimizers end close together. Matching the ratio gives 0.5–0.85B tokens (non-embedding / all
+params), so 1B. Batch halved to 128 × 2048 = 0.26M tokens (3,814 steps), to get closer to the 1B run's ~11k steps.
+Everything else as the 6B proxy runs (WSD 2% / 10%, `--dyn_every 50`). Plots `plots/dyn3/`, stage medians
+`plots/dyn3/summary.md`, JSONL in `/work/$USER/llama_models/proxy-dyn-*-1b-bs128*/`. 13 jobs, 565026–565038, 18–26 min
+each on 8 H200.
+
+| Optimizer | Norm wd off (seed default / 1) | Norm wd on (seed default / 1) | On − off |
+|---|---|---|---|
+| Muon 0.01 + AdamW 3e-3 | 3.249 / 3.248 (565031, 565033) | **3.240** / 3.244 (565026, 565032) | −0.009 / −0.004 |
+| SOAP 4e-3 | 3.248 / 3.249 (565028, 565035) | **3.236** / 3.239 (565034, 565036) | −0.012 / −0.010 |
+| AdamW 1e-3 | 3.336 (565027) | | |
+| Sophia 2e-4, ρ 0.05, wd 0.2 (retuned) | 3.423 (565029; win rate 0.25 at the end) | | |
+| Sophia 2e-4, ρ 0.01, wd 0.1 (old) | 3.439 (565030; win rate 0.07) | | |
+
+LR check at 0.7× (the LRs came from 0.5M-batch sweeps): Muon 0.007 + AdamW 2e-3 3.242 (565037) vs 3.240, a tie;
+SOAP 2.8e-3 3.239 (565038) vs 3.248, better.
+
+Findings:
+- **Seed noise on the proxy is small:** 0.001–0.004 between seeds. Treat ≥ ~0.008 as real at this setup.
+- **Norm weight decay helps in the data-limited regime:** all 4 pairs favor it (SOAP −0.011, Muon −0.004 to −0.009).
+  At 6B it was ≤ 0.004 (2026-10-17). Keep it on (the muonium default); for SOAP, use `--norm_wd`.
+- **Ranking unchanged, gaps 3× the 6B ones:** SOAP ≈ Muon < AdamW (+0.09) < Sophia (+0.18), vs +0.035 / +0.06 at 6B.
+- **The batch matters as much as the budget here.** At the 0.5M batch, 1B tokens: AdamW +0.15 and Sophia +0.31 behind
+  Muon (3.406 / 3.566 vs 3.252); at 0.26M: +0.09 / +0.18. Muon and SOAP barely change (3.252 → 3.240, 3.247 → 3.248), so
+  AdamW and Sophia gain the most from extra steps. Compare proxy optimizers only at a fixed batch.
+- **SOAP's LR wants to scale with the batch** (0.7× better), Muon's does not (0.7× ties).
+
+Dynamics, stable-phase medians, 6B (0.5M batch) → 1B (0.26M batch). Two changes at once, so read the direction, not the size:
+
+| Metric (global unless noted) | Muon | AdamW | SOAP | Sophia (retuned) |
+|---|---|---|---|---|
+| Directional sharpness | 0.0038 → 0.0048 | 0.0126 → 0.0204 | 0.0011 → 0.0015 | 0.0042 → 0.0068 |
+| Gradient cosine, consecutive steps | −0.65 → −0.47 | −0.04 → 0.00 | +0.13 → +0.20 | +0.36 → +0.28 |
+| Gradient cosine in the decay | −0.24 → −0.01 | +0.17 → +0.14 | +0.28 → +0.30 | +0.41 → +0.27 |
+| Update effective rank (fraction) | 0.96 → 0.96 | 0.46 → 0.34 | 0.69 → 0.67 | 0.48 → 0.40 |
+| attn_o update effective rank | 0.93 → 0.93 | 0.27 → 0.20 | 0.50 → 0.48 | 0.31 → 0.26 |
+| Weight stable rank | 112 → 117 | 59 → 49 | 103 → 109 | 44 → 22 |
+| mlp_down σ1 | 4.6 → 4.2 | 8.0 → 5.3 | 16.8 → 13.1 | 13.3 → 12.8 |
+| ‖norm weights‖ (init 138) | 58 → 85 | 130 → 138 | 91 → 106 (no wd) | 121 → 131 |
+
+- Every qualitative pattern from 6B holds: Muon's near-full-rank updates and edge-of-stability oscillation, SOAP the
+  flattest without oscillation, AdamW the sharpest with low-rank updates (attn_q / attn_o lowest), Muon's flattest
+  weight spectra, SOAP's largest weights.
+- The ordering of sharpness and update rank is identical, and the gaps widen: AdamW is 4.3× Muon's sharpness (3.3× at
+  6B) and its update rank drops to 0.34. Fewer steps leave less time for its low-rank updates to fill out.
+- Muon's oscillation is weaker in the stable phase (−0.47) and gone in the decay (≈ 0).
+- Sophia's weight stable rank halves (44 → 22): its weights are dominated by a few directions in the short run.
+- The norm weights shrink less in 1B tokens (fewer decay steps), yet norm wd still helps more than at 6B.
+
+Next: rerun the SOAP norm wd pair at 2.8e-3 if SOAP is still a candidate for the 1B model (its +31% step time there
+makes it unlikely).
+
+## 2026-10-18 — SOAP with `--soap_precondition_1d` (full preconditioner for the RMSNorm weights), 1B tokens
+
+New flag `--soap_precondition_1d` (official SOAP's `precondition_1d`; default off). Off, the 1-D params get plain Adam:
+the paper (sec. 4.1) runs AdamW on 1-D layers "to reduce the overhead" and does not test the alternative. On, each 768-dim
+norm weight gets a 768 x 768 preconditioner (eigenbasis refreshed every 10 steps). One change against 565034 (SOAP 4e-3,
+`--norm_wd`, default seed, batch 128 x 2048, 1B tokens, `--dyn_every 50`). Plots `plots/dyn4/`.
+
+| Run (job) | Eval @ step 191 / 955 / 1910 / 2865 / end | Train runtime |
+|---|---|---|
+| `proxy-dyn-soap-normwd-1b-bs128` (565034) | 4.717 / 3.686 / 3.498 / 3.422 / **3.236** | 1162 s |
+| `proxy-dyn-soap-normwd-1b-bs128-s1` (565036, seed 1) | 4.684 / 3.688 / 3.502 / 3.427 / 3.239 | 1164 s |
+| `proxy-dyn-soap-normwd-pc1d-1b-bs128` (565953) | 4.726 / 3.707 / 3.502 / 3.422 / **3.238** | 1168 s |
+
+- **No effect: 3.238 vs 3.236 / 3.239**, inside the seed spread. Cost +0.5% time.
+- The norm blocks' dynamics differ only in warmup: updates ~40% smaller (upd_rms 3.7e-4 vs 6.1e-4) and nearly
+  orthogonal to the gradient (alignment 0.01 vs 0.50), as the eigenbasis comes from a few noisy gradients. This shows in
+  the early evals (+0.02 at step 955) and is gone by step 1910. Stable and decay: within a few % on every metric
+  (alignment 0.23 vs 0.21, sharpness 0.152 vs 0.155, ‖norm weights‖ 61 vs 57); the rest of the model is unchanged.
+- The paper's default (Adam on 1-D) costs nothing here. No reason to put SOAP on the norms in the Muon setup.
+
+## 2026-10-18 — NorMuon on the proxy (1B tokens, batch 128), with optimizer dynamics
+
+`proxy-dyn-normuon-1b-bs128` (566231): the proxy Muon run 565026 with `--muonium_algorithm=normuon` (the 1B model's
+default; `train_scorer.py` defaults to plain Muon). NorMuon 0.01, AdamW 3e-3 on embedding + norms, norm wd on, batch
+128 x 2048, 1B tokens, `--dyn_every 50`. LRs as on the 1B model, where NorMuon was swept (2026-10-15). Plots `plots/dyn5/`
+(Muon, NorMuon, SOAP-normwd).
+
+| Run (job) | Eval @ step 955 / 1910 / 2865 / end | Train runtime |
+|---|---|---|
+| Muon (565026; seed 1: 565032 3.244) | 3.718 / 3.512 / 3.430 / 3.240 | 1472 s |
+| NorMuon (566231) | 3.711 / 3.509 / 3.428 / **3.239** | 1660 s (+13%) |
+| SOAP 4e-3, norm wd (565034) | 3.686 / 3.498 / 3.422 / 3.236 | 1162 s |
+
+- **Tie on the proxy: 3.239 vs 3.240 / 3.244** (1B model: NorMuon −0.008 vs Muon, one seed each). Slightly ahead at
+  every eval but within the seed spread. The proxy's SOAP ≈ Muon result holds against NorMuon too.
+- **What NorMuon changes: per-row update size, and only there.** Row-norm CV of the update (stable median):
+
+  | Block | attn_q | attn_k | attn_v | attn_o | mlp_gate | mlp_up | mlp_down |
+  |---|---|---|---|---|---|---|---|
+  | Muon | 0.050 | 0.018 | 0.012 | 0.009 | 0.123 | 0.127 | 0.006 |
+  | NorMuon | 0.014 | 0.014 | 0.011 | 0.008 | 0.027 | 0.028 | 0.006 |
+  | SOAP | 0.093 | 0.089 | 0.126 | 0.042 | 0.123 | 0.124 | 0.024 |
+
+  Orthogonalized updates already have near-equal rows where rows ≤ columns (attn_o, mlp_down); in the tall mlp_gate /
+  mlp_up (2048 x 768) and in attn_q, Muon's rows vary 5-12% and NorMuon flattens them 3.5-4.5x.
+- Everything else matches Muon within a few %: sharpness 0.0048 vs 0.0048, update effective rank 0.954 vs 0.959,
+  weight stable rank 117 vs 117, mlp_down σ1 4.23 vs 4.23. The oscillation is a little stronger (grad cos −0.52 vs
+  −0.47 stable, −0.04 vs −0.01 decay); alignment with −g a little lower (0.112 vs 0.129).
+- +13% time on the proxy (extra second-moment pass per matrix; at 1B it ran at about AdamW speed).
+
+## 2026-10-18 — SOAP retuned on the 1B model (1B tokens, current defaults) vs NorMuon
+
+**Why.** The only 1B-model SOAP runs (2026-10-08) used LR 3e-4 copied from AdamW, ε 1e-5, concat packing, no norm wd, and
+beat AdamW by just 0.03; on the proxy, tuned SOAP ties Muon and its best LR is 3-4x AdamW's. Setup: train.py defaults
+(doc packing, `--batch_ramp 32:0.5,64`, step-unit WSD 2% / 10%, wd 0.1, 2,860 steps), 1B tokens, one seed each. SOAP:
+official, β 0.95 / 0.95, ε 1e-8, preconditioner every 10, `--norm_wd`. Baseline rerun with exactly these flags.
+
+| Run (job) | LR | Eval @ 0.15B / 0.30B / 0.49B (switch) / 0.70B / 0.92B (decay start) / **end** | Train time |
+|---|---|---|---|
+| `muon-default-1b-soapcmp` (566172) | NorMuon 0.01 + AdamW 3e-3 | 3.787 / 3.473 / 3.324 / 3.127 / 3.029 / **2.945** | 3673 s (~3100 s + ~9.5 min compile) |
+| `soap7.5e-4-normwd-1b` (566173) | 7.5e-4 | 3.930 / 3.505 / 3.314 / 3.144 / 3.044 / 2.991 | 4039 s |
+| `soap1.5e-3-normwd-1b` (566174) | 1.5e-3 | 3.810 / 3.485 / 3.308 / 3.136 / 3.031 / 2.965 | 4058 s |
+| `soap3e-3-normwd-1b` (566175) | 3e-3 | 3.875 / 3.532 / 3.337 / 3.143 / 3.022 / **2.952** | 4050 s |
+
+- **Retuning closes most of the gap, but SOAP still trails: best 2.952 (3e-3) vs NorMuon 2.945 (+0.007)**, ~2x the 0.003
+  seed noise seen on this model. The old untuned comparison put SOAP far behind; now it is close.
+- **The best LR is at the grid edge**, with shrinking gains (7.5e-4 → 1.5e-3: −0.026, → 3e-3: −0.013); 6e-3 is the
+  open point. 3e-3 matches the proxy's best (2.8e-3-4e-3): the LR transferred 1:1, as Muon's did.
+- **Where SOAP loses: the decay.** Mid-run SOAP 1.5e-3 is level with or ahead of NorMuon (0.49B: 3.308 vs 3.324; 0.92B:
+  3.031 vs 3.029), and SOAP 3e-3 is ahead at the decay start (3.022 vs 3.029). In the last 10% NorMuon drops 0.084, SOAP
+  0.066-0.070. On the proxy too, Muon's oscillation ends in the decay, where it gains the most (2026-10-17).
+- **Cost: SOAP +30% per step** (~4040 s vs ~3100 s without Muon's one-off compile), as measured at 0.5M (+31%). At 6B:
+  NorMuon ~42 GPU-h, SOAP ~55 GPU-h, inside the 64 H200-h cap but with little margin.
+- Verdict for now: keep NorMuon. SOAP would need to win at equal tokens to justify +30%, and it doesn't at 1B.
+  Open: SOAP 6e-3 (closes the grid), and a longer decay for SOAP (its loss is level until the decay).
+
+## 2026-10-18 — EXPERIMENT_PLAN Stage 0 and Stage A (per-block optimizer options on the proxy, NorMuon baseline)
+
+Details: `results/STAGE0.md`, `results/STAGE_A.md`, `plots/stageA/phases.md`. New flags: `--muon_split_heads`,
+`--muon_lr_mult_kv`, `--norm_lr`, `--embed_optimizer`; decay branches use existing `--save_at_tokens` / `--resume_from`
+(+ `--token_budget`, `--decay_frac`); `analyze_dynamics.py` writes `phases.md`.
+
+| Run (1B tokens, batch 128) | Final eval | Δ vs NorMuon mean 3.238 (566231 3.239, 566904 3.237) | Gate |
+|---|---|---|---|
+| split k/v heads (566905) | 3.239 | +0.001 | fail |
+| split q/k/v heads (566906; seed 2 567269) | 3.2339 / 3.2403 | −0.0012 (2-seed mean) | mechanism achieved (normalized overshoot and global oscillation down; the raw-overshoot gate was mis-specified), no loss effect |
+| k/v LR x0.5 (566907) | 3.237 | −0.001 | fail |
+| norm LR 1e-3 (566908) | 3.245 | +0.007 | fail |
+| SOAP on the tied embedding (567070) | 3.240 | +0.002 | pass (embed stable rank 12.4 vs 2.7), no loss effect |
+
+- **Bug fixed: `ChainedOptimizer` ran at a constant LR** (no warmup / decay) while logging the schedule; accelerate's
+  `prepare()` reloads the optimizer state and the chained param_groups went stale. Invalidates 566909 (first SOAP-embed
+  run, 3.380) and `muonium-normuon-sophia-1b` (2026-10-15). Test added.
+- Seed noise of NorMuon on the proxy: 0.002 (3.239 / 3.237).
+
+## 2026-10-19 — SOAP 3e-3 vs NorMuon at 3B tokens on the 1B model
+
+**Why.** At 1B tokens, retuned SOAP (3e-3) trailed NorMuon by 0.007 and lost it in the decay (2026-10-18). Does that
+hold at 3B? Setup: train.py defaults (doc packing, `--batch_ramp 32:0.5,64`, step-unit WSD 2% / 10%, wd 0.1, 8,583
+steps, decay from step 7,725), `--norm_wd`, 3B tokens, one seed each. NorMuon rerun with exactly these flags (552056,
+2.714, used the old 1/3 switch). Eval losses at W&B precision.
+
+| Run (job, W&B) | Eval @ 0.56B / 1.13B / 1.46B (switch) / **2.55B (decay start)** / **end** | Decay gain | Wall time |
+|---|---|---|---|
+| `normuon-default-3b-soapcmp` (566892, k9k39bp7) | 3.2943 / 3.1464 / 3.1058 / 2.9154 / **2.7075** | 0.208 | 2:36 h (incl. 8.5 min compile) |
+| `soap3e-3-normwd-3b` (566891, syx7kgpw) | 3.2994 / 3.1137 / 3.0547 / 2.8807 / **2.7014** | 0.179 | 3:11 h |
+| Δ SOAP − NorMuon | +0.005 / −0.033 / −0.051 / −0.035 / **−0.006** | −0.029 | |
+
+- **SOAP wins at 3B: 2.7014 vs 2.7075 (−0.006)**, about 2x the ~0.003 seed noise on this model; one seed each. At 1B it
+  lost by 0.007.
+- **Same shape as at 1B, larger stable-phase lead.** SOAP trails for the first ~0.6B tokens, leads from step ~2,500,
+  by up to 0.051 before the batch switch and 0.035 at the decay start. NorMuon gains 0.029 more in the decay and closes
+  most of it. The decay is where NorMuon wins on both the 1B model and the proxy.
+- **Step time (from tqdm, stable segments):** batch 32 (262k tokens): SOAP 1.05 s vs NorMuon 0.76 s (+39%); batch 64
+  (524k): 1.85 s vs 1.55 s (+19%). SOAP's extra cost is ~0.3 s per step regardless of batch (the preconditioner), so
+  larger batches dilute it. Whole run: +22% (11,423 s vs 9,343 s, NorMuon including its one-off compile).
+- **6B projection** (same schedule: 11,444 steps at batch 32 + 5,722 at batch 64, ~40 evals x 15 s, startup):
+  NorMuon ~5.1 h = **~41 H200-h**; SOAP ~6.5 h = **~52 H200-h**. Both inside the 64 H200-h cap; SOAP leaves ~12 h
+  of margin (vs ~23 h for NorMuon). Checkpoint saves not included (a few minutes).
+- Open: whether SOAP's lead at the decay start keeps growing with tokens (0.007 ahead at 1B → 0.035 ahead
+  at 3B) or the longer decay at 6B (1,716 steps) lets NorMuon close more of it. A second seed of each at 3B would firm
+  up the −0.006.
+
+## 2026-10-19 — EXPERIMENT_PLAN Stage B: NorMuon → AdamW switch? Decay branches at 6b (details: `results/STAGE_B.md`)
+
+Proxy 6b config (524k tokens / step, 11,444 steps), checkpoints at 3000 / 5500 / 8000, a 1,144-step linear decay
+branch from each. R(S) = branch final eval.
+
+| | S = 3000 | 5500 | 8000 | 10300 (full run) |
+|---|---|---|---|---|
+| NorMuon R (floor = stable − R) | 3.0726 (0.206) | 3.0216 (0.186) | 2.9959 (0.181) | 2.9820 (0.183) |
+| AdamW R (floor) | 3.1660 (0.170) | 3.0841 (0.128) | 3.0408 (0.115) | 3.0167 (0.110) |
+
+- **No switch benefit:** at matched R (3.017-3.073) AdamW's −dR/dS is 0.59-0.77x NorMuon's; the plan's switch rule
+  needs ≥ 1.2x. B4 skipped (pending the user's confirmation).
+- **The decay's "noise floor" is not constant**: it shrinks with S, AdamW 0.170 → 0.110, NorMuon 0.206 → 0.183. NorMuon
+  carries ~0.07 more removable loss late in training, so stable-phase evals understate it (step 8000: AdamW 0.021 lower
+  stable, 0.045 higher after decay).
+- 6b seed noise, NorMuon: 0.0033 (2.98197 / 2.98527; mean 2.9836, ties Muon's 2.983). AdamW same-seed repeat: 0.003.

@@ -21,6 +21,19 @@ from llama_train.optim import build_optimizer, uses_sophia
 from llama_train.trainer import CustomTrainer
 
 
+TEAM_WANDB_ENTITY = "cerulean-labs"
+
+
+def check_dyn_wandb(args):
+    """--dyn_every logs dozens of dyn_* panels per run: keep them off the team W&B dashboard (run.sbatch's default
+    entity). Point WANDB_ENTITY / WANDB_PROJECT at a personal workspace (train_scorer.py does) or set WANDB_MODE=disabled."""
+    if args.dyn_every and os.environ.get("WANDB_ENTITY") == TEAM_WANDB_ENTITY and os.environ.get("WANDB_MODE") != "disabled":
+        raise SystemExit(f"--dyn_every would log optimizer-dynamics charts to the team W&B entity {TEAM_WANDB_ENTITY}. "
+                         "Set WANDB_ENTITY / WANDB_PROJECT to a personal workspace (e.g. sbatch --export=ALL,"
+                         "WANDB_ENTITY=bendoris0509-national-yang-ming-chiao-tung-university,WANDB_PROJECT=<project>), "
+                         "or WANDB_MODE=disabled.")
+
+
 def optim_dynamics_callbacks(args, save_dir):
     """--dyn_every: OptimDynamicsCallback on rank 0 (gradients are all-reduced and weights replicated under DDP, so the
     other ranks would measure the same). JSONL at --dyn_out; W&B panels dyn_<metric>/<block type> on train/global_step."""
@@ -43,6 +56,7 @@ def main(argv=None):
     print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)  # GPU check
 
     args = cli.parse_args(argv)
+    check_dyn_wandb(args)
     cli.print_summary(args)
     save_dir = cli.save_dir(args)
     plan = P.make_plan(args, int(os.environ.get("WORLD_SIZE", 1)))
