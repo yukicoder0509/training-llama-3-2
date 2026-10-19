@@ -28,6 +28,9 @@ and measures, for every parameter tensor, then aggregates per block type
              ||dW||_F. (Its QK-product variant, Delta_2 = dWq Wk^T + Wq dWk^T, is not
              implemented here.)
 
+GradNoiseScale / GradNoiseCallback (separate, all ranks): gradient noise scale B_simple = tr(Sigma) / |G|^2 from two
+fresh micro-batches at the same weights -> gns_G2, gns_trS, gns_B per group (see the class docstring).
+
 Group values for norms / cosines / curvature are exact: they are computed from summed
 dot products, i.e. as if the group's tensors were flattened into one vector (the
 "global" group reproduces MiniCPM's whole-model definitions). Spectral values are
@@ -464,6 +467,79 @@ class OptimDynamicsLogger:
 
 
 # ---------------------------------------------------------------------------
+# gradient noise scale
+# ---------------------------------------------------------------------------
+
+
+class GradNoiseScale:
+    """Gradient noise scale B_simple = tr(Sigma) / |G|^2 (McCandlish et al. 2018, "An Empirical Model of Large-Batch
+    Training"): G = full-data gradient, Sigma = covariance of the gradient of ONE unit (token or sequence).
+
+    A mean gradient over b independent units is g = G + eps, E[eps] = 0, Cov(eps) = Sigma / b, so
+    E|g|^2 = |G|^2 + tr(Sigma) / b, and for two INDEPENDENT batches at the SAME weights E[g1 . g2] = |G|^2. Per
+    measurement:
+        G2  = g1 . g2                                  unbiased |G|^2
+        trS = b * ((|g1|^2 + |g2|^2) / 2 - g1 . g2)    unbiased tr(Sigma) per unit
+        B   = trS / G2                                 in the unit of b
+    |g1|^2, |g2|^2 and g1 . g2 are kept per tensor and summed per group (global, block type). Under DDP every rank
+    measures its own pair and the sums are averaged over ranks. Gradients come from torch.autograd.grad, so p.grad and
+    DDP's hooks are untouched. For analysis average trS and G2 over a window, then divide: one G2 can be ~0 or < 0.
+
+    loss_fn(i) -> (loss, b): loss of the i-th (i = 0, 1) fresh micro-batch at the current weights, under the training
+    autocast, and the number of units it averages over (non-padding loss tokens for a per-token mean). The two batches
+    must not overlap each other or the training stream.
+    """
+
+    def __init__(self, model: torch.nn.Module, loss_fn: Callable[[int], tuple[torch.Tensor, int]],
+                 rules: list[tuple[str, str]] | None = None):
+        self.loss_fn = loss_fn
+        self.params = [(n, p, *classify(n, p, rules or DEFAULT_RULES)) for n, p in model.named_parameters()
+                       if p.requires_grad]
+
+    def measure(self) -> dict:
+        """One measurement: {"global/gns_G2", "global/gns_trS", "global/gns_B", "global/gns_b", "global/gns_loss",
+        "type/<type>/gns_*"}. Collective under torch.distributed: every rank must call it at the same step."""
+        ps = [p for _, p, _, _ in self.params]
+        sums = torch.zeros(len(ps), 3, dtype=torch.float64, device=ps[0].device)  # |g1|^2, |g2|^2, g1 . g2
+        g1, bs, loss_sum = None, [], 0.0
+        for i in range(2):
+            loss, b = self.loss_fn(i)
+            grads = torch.autograd.grad(loss, ps)
+            bs.append(b)
+            loss_sum += loss.detach().double()
+            if g1 is None:
+                g1 = grads
+                for j, g in enumerate(grads):
+                    sums[j, 0] = g.float().pow(2).sum()
+            else:
+                for j, (a, g) in enumerate(zip(g1, grads)):
+                    a, g = a.float(), g.float()
+                    sums[j, 1] = g.pow(2).sum()
+                    sums[j, 2] = (a * g).sum()
+            del loss, grads
+        del g1
+        assert bs[0] == bs[1], f"the two micro-batches average over different unit counts: {bs}"
+        b = bs[0]
+        stats = torch.cat([sums.reshape(-1), loss_sum.reshape(1) / 2])
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            stats /= torch.distributed.get_world_size()
+        S = stats[:-1].reshape(-1, 3).cpu().tolist()
+        groups: dict[str, list[int]] = defaultdict(list)
+        for j, (_, _, _, typ) in enumerate(self.params):
+            groups["global"].append(j)
+            groups[f"type/{typ}"].append(j)
+        rec: dict = {"global/gns_b": float(b), "global/gns_loss": stats[-1].item()}
+        for gname, idx in groups.items():
+            gg1, gg2, g12 = (sum(S[j][k] for j in idx) for k in range(3))
+            trS = b * ((gg1 + gg2) / 2 - g12)
+            rec[f"{gname}/gns_G2"] = _safe(g12)
+            rec[f"{gname}/gns_trS"] = _safe(trS)
+            rec[f"{gname}/gns_B"] = _safe(_div(trS, g12)) if g12 > 0 else None
+        return rec
+
+
+# ---------------------------------------------------------------------------
 # HF Trainer callback
 # ---------------------------------------------------------------------------
 
@@ -492,6 +568,33 @@ try:
         def on_optimizer_step(self, args, state, control, **kw):
             if self.logger is not None:
                 self.logger.after_step()
+
+    class GradNoiseCallback(TrainerCallback):
+        """GradNoiseScale every `every` optimizer steps, after the step (weights of step t, p.grad already cleared).
+        Attach on EVERY rank (the measurement all-reduces); rank 0 appends the record to out_path and calls log_fn.
+        extra_fn(step) -> dict adds fields to the record (e.g. the training batch in tokens)."""
+
+        def __init__(self, loss_fn_for_step, every, out_path=None, log_fn=None, extra_fn=None):
+            """loss_fn_for_step(step) -> GradNoiseScale's loss_fn for the measurement at that step (fresh batches)."""
+            self.loss_fn_for_step, self.every, self.out_path, self.log_fn = loss_fn_for_step, every, out_path, log_fn
+            self.extra_fn = extra_fn
+            self.gns: GradNoiseScale | None = None
+
+        def on_train_begin(self, args, state, control, model=None, **kw):
+            self.gns = GradNoiseScale(model, loss_fn=None)
+
+        def on_step_end(self, args, state, control, **kw):
+            step = state.global_step
+            if self.gns is None or step % self.every:
+                return
+            self.gns.loss_fn = self.loss_fn_for_step(step)
+            rec = {"step": step, "time": time.time(), **self.gns.measure(), **(self.extra_fn(step) if self.extra_fn else {})}
+            if state.is_world_process_zero:
+                if self.out_path:
+                    with open(self.out_path, "a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                if self.log_fn:
+                    self.log_fn({k: v for k, v in rec.items() if v is not None and k not in ("step", "time")}, step)
 
 except ImportError:  # transformers not installed
     pass

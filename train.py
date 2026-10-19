@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, TrainingArguments
 
 from llama_train import cli
 from llama_train import plan as P
-from llama_train.callbacks import (DeadlineCallback, ProfilerCallback, SaveAtTokensCallback, SophiaHessianCallback,
+from llama_train.callbacks import (DeadlineCallback, ProfilerCallback, RampLRCallback, SaveAtTokensCallback, SophiaHessianCallback,
                                    StepTimerCallback, WandbTokenAxisCallback, slurm_time_left)
 from llama_train.data import DocPackingCollate, load_datasets
 from llama_train.model import TOKENIZER, build_model, flops_per_token, llama_config
@@ -49,6 +49,41 @@ def optim_dynamics_callbacks(args, save_dir):
         log_every=args.dyn_every, spectral_every=args.dyn_spectral_every, out_path=out, erank=args.dyn_erank,
         track_delta=args.dyn_track_delta,
         log_fn=make_wandb_log_fn(per_layer="heatmap" if args.dyn_heatmap_every else "none", heatmap_every=args.dyn_heatmap_every or 1))]
+
+
+def grad_noise_callbacks(args, plan, model, train_ds, collate, save_dir, seed):
+    """--dyn_noise: GradNoiseCallback on every rank (each rank measures one pair; the sums are averaged over ranks).
+    The micro-batches are train.bin blocks that RampBatchSampler's permutation (same seed) puts after the last trained
+    step, so they are never trained on and disjoint across ranks, the pair and measurements. Loss = the training loss
+    (mean over the micro-batch's predicted tokens) under the training autocast; b = predicted tokens per micro-batch."""
+    if not (args.dyn_every and args.dyn_noise):
+        return []
+    assert plan.ramp, "--dyn_noise draws its batches past the end of the --batch_ramp sampler's permutation"
+    from llama_train.optim_dynamics import GradNoiseCallback, make_wandb_log_fn
+    rank, world = int(os.environ.get("RANK", 0)), plan.world_size
+    perm = torch.randperm(len(train_ds), generator=torch.Generator().manual_seed(seed))
+    tail = perm[sum(b * n for b, n in plan.ramp):]
+    stride = max(b for b, _ in plan.ramp) // (world * plan.grad_accum)  # per-GPU micro-batch at the largest batch
+    assert (plan.max_steps // args.dyn_every + 1) * world * 2 * stride <= len(tail), "not enough unused blocks for --dyn_noise"
+
+    def loss_fn_for_step(step):
+        m = plan.batch_at(step) // (world * plan.grad_accum)  # the training micro-batch: same compiled shapes
+        start = ((step // args.dyn_every) * world + rank) * 2 * stride
+
+        def loss_fn(i):
+            feats = [train_ds[j] for j in tail[start + i * m:start + (i + 1) * m].tolist()]
+            batch = collate(feats) if collate else {k: torch.stack([f[k] for f in feats]) for k in feats[0]}
+            batch = {k: v.cuda(non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss = model(**batch).loss
+            return loss, m * (plan.block_size - 1)
+        return loss_fn
+
+    out = os.path.expanduser(args.dyn_out or os.path.join(save_dir, "optim_dynamics.jsonl"))  # shared with the dyn logger
+    print(f"Gradient noise scale every {args.dyn_every} steps, {len(tail):,} unused blocks -> {out}")
+    return [GradNoiseCallback(loss_fn_for_step, args.dyn_every, out_path=out,
+                              log_fn=make_wandb_log_fn(per_layer="none") if rank == 0 else None,
+                              extra_fn=lambda step: {"global/gns_batch": plan.batch_at(step) * plan.block_size})]
 
 
 def main(argv=None):
@@ -118,6 +153,7 @@ def main(argv=None):
     optimizer, sophia_opt = build_optimizer(args, model, config, plan, training_args)
 
     step_timer = StepTimerCallback(plan, flops_per_token(model, config, block_size), start_time)
+    collate = DocPackingCollate(config.bos_token_id, block_size) if args.packing == "doc" else None
     sophia_stats = {}
     sophia_cb = SophiaHessianCallback(args, plan, model, optimizer, sophia_opt, sophia_stats) if uses_sophia(args) else None
     time_left = slurm_time_left()
@@ -128,13 +164,15 @@ def main(argv=None):
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        data_collator=DocPackingCollate(config.bos_token_id, block_size) if args.packing == "doc" else None,
+        data_collator=collate,
         # Sophia's Hessian pass before step_timer, so its time counts in tokens_per_second / MFU
         callbacks=([sophia_cb] if sophia_cb else [])
         + [DeadlineCallback(deadline, start_time), step_timer, WandbTokenAxisCallback(args, plan)]
         + ([SaveAtTokensCallback(save_steps, ckpt_dir, plan)] if save_steps else [])
+        + ([RampLRCallback(plan, args.ramp_lr_mult)] if args.ramp_lr_mult != 1.0 else [])
         + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else [])
-        + optim_dynamics_callbacks(args, save_dir),
+        + optim_dynamics_callbacks(args, save_dir)
+        + grad_noise_callbacks(args, plan, model, train_ds, collate, save_dir, training_args.seed),
         optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
         cli_args=args, plan=plan, lr_lambda=lr_lambda, dev_dataset=dev_ds, step_timer=step_timer, extra_logs=sophia_stats,
         keep_step_batches=sophia_cb is not None,

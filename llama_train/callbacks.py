@@ -2,6 +2,7 @@
 pass, torch.profiler."""
 
 import contextlib
+import itertools
 import os
 import subprocess
 import time
@@ -53,6 +54,27 @@ class SaveAtTokensCallback(TrainerCallback):
             os.symlink(f"checkpoint-{state.global_step}", link)
             print(f"=== checkpoint at step {state.global_step} ({self.plan.tokens_seen(state.global_step):,} tokens) -> {link}")
         return control
+
+
+class RampLRCallback(TrainerCallback):
+    """--ramp_lr_mult: at each --batch_ramp switch, multiply the LR of the Muon / NorMuon param groups by `mult`. Scales
+    the scheduler's base LR (HF's WSD is a LambdaLR: lr = base x factor), so the schedule continues with the same shape
+    from the new peak, and the group's current LR, which the scheduler already set for the next step. Runs after the last
+    step of each stage: the first step at the new batch has the new LR."""
+
+    def __init__(self, plan, mult):
+        assert plan.ramp, "--ramp_lr_mult needs --batch_ramp"
+        self.switch_steps, self.mult = set(itertools.accumulate(n for _, n in plan.ramp[:-1])), mult
+
+    def on_step_end(self, args, state, control, optimizer=None, lr_scheduler=None, **kwargs):
+        if state.global_step not in self.switch_steps:
+            return
+        sched = getattr(lr_scheduler, "scheduler", lr_scheduler)  # accelerate's AcceleratedScheduler wraps it
+        for i, g in enumerate(optimizer.param_groups):
+            if g.get("algorithm") in ("muon", "normuon"):
+                sched.base_lrs[i] *= self.mult
+                g["lr"] *= self.mult
+                print(f"=== step {state.global_step}: batch switch, group {i} ({g['algorithm']}) LR x {self.mult:g} -> {g['lr']:.4g}")
 
 
 class DeadlineCallback(TrainerCallback):

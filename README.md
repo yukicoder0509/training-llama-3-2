@@ -72,6 +72,8 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--batch_ramp` | `32:0.5,64` | `none` for a fixed batch. `"B1:t1,...,Bn"`: batch Bi for the next ti tokens, the last for the rest. ti > 1 is a token count (`32:1e9,64`, or `32:1B,64` / `32:333M,64`): the switch is at the same tokens for any budget. ti ≤ 1 is a fraction of the budget (`32:0.3333,64`: 333M of 1B, 1B of 3B). Switches at the last whole step within the stage; LRs and the LR schedule are unchanged. Overrides `--global_batch_size` |
 | `--learning_rate` / `--weight_decay` / `--beta2` | `3e-3` (muonium), else `6e-4` / `0.1` / `0.95` | Peak LR; with muon / muonium the AdamW (embedding, norms) part |
 | `--warmup_frac` / `--decay_frac` | `0.02` / `0.1` | Linear warmup, then WSD with linear decay to 0 over the final fraction (0.1 as in MiniCPM; runs before 2026-10-14 used 0.2) |
+| `--decay_type` | `linear` | Shape of the WSD decay: `linear`, `1-sqrt` or `cosine` (step units only) |
+| `--ramp_lr_mult` | `1.0` | `--batch_ramp` + muonium: at each batch switch multiply the Muon / NorMuon groups' LR by this (cumulative; `1.414` = √2 for a 2x batch). The schedule keeps its shape from the new peak; AdamW groups unchanged |
 | `--lr_schedule` / `--min_lr_ratio` | `wsd` / `0.1` | `cosine`: cosine from the peak to `min_lr_ratio` × peak (Llama 2/3). `wsd2`: warmup, stable, decay to `--stable2_lr_ratio` × peak over `--decay1_frac`, stable for `--stable2_frac`, then decay to 0 over `--decay_frac` |
 | `--seed` | none | Init, data order and Sophia's label sampling (repeat-seed runs) |
 | `--schedule_unit` | `steps` | `tokens`: WSD warmup / decay as fractions of `--token_budget` tokens, so the LR at a token count doesn't depend on the batch ramp (needed to branch runs from a checkpoint) |
@@ -98,6 +100,7 @@ Adam-mini about the same. Flag and DDP sweeps: experiments.md 2026-10-08.
 | `--dyn_erank`, `--dyn_track_delta` | on | Effective rank of dW; effective rank of W_t − W_(t−N) (keeps one copy of the matrices) |
 | `--dyn_out` | `<save_dir>/optim_dynamics.jsonl` | One JSON line per measurement; W&B gets `dyn_<metric>/<block type>` on train/global_step |
 | `--dyn_heatmap_every` | `10` | W&B (layer x block type) heatmap images every N measurements (0: none) |
+| `--dyn_noise` | off | Also the gradient noise scale every `--dyn_every` steps (all ranks): `dyn_gns_G2`, `dyn_gns_trS`, `dyn_gns_B` (tokens) per block type, `dyn_gns_batch/global` = the training batch in tokens. Needs `--batch_ramp` (its batches are blocks past the end of the ramp sampler's permutation). See "Gradient noise scale" below |
 
 Runs are bounded by the token budget: the step count comes from `--token_budget`, and a run ends when those steps are
 done. The Slurm time limit is only a safety net. Training stops 5 min before it (read from `squeue`) and still saves
@@ -171,6 +174,27 @@ against `train/global_step`. More W&B outputs:
 
 The JSONL (`--dyn_out`) has every value, per layer included, under keys `global/<m>`, `type/<t>/<m>` and
 `layer/<LLL>/<t>/<m>`; load it with `load_dynamics()`.
+
+### Gradient noise scale (`--dyn_noise`)
+
+B_noise = tr(Σ) / |G|² (McCandlish et al. 2018, "B_simple"): G = the full-data gradient, Σ = the covariance of one
+token's gradient. It is the batch at which gradient noise equals the signal, a proxy for the critical batch. A mean
+gradient over b tokens is g = G + ε with Cov(ε) = Σ/b, so for two independent micro-batches at the same weights
+E[g₁·g₂] = |G|². Every `--dyn_every` steps each rank draws two fresh micro-batches of the current per-GPU size (blocks
+the training never reads), computes g₁, g₂ with `torch.autograd.grad` (p.grad untouched) and per tensor |g₁|², |g₂|²,
+g₁·g₂; the sums are averaged over ranks (8 pairs per measurement) and summed per group:
+
+| Key | Value |
+|---|---|
+| `gns_G2` | g₁·g₂: unbiased \|G\|² |
+| `gns_trS` | b ((\|g₁\|² + \|g₂\|²)/2 − g₁·g₂): unbiased tr(Σ) per token, b = predicted tokens per micro-batch (`gns_b`) |
+| `gns_B` | trS / G2 in tokens, per measurement: noisy, G2 can be ~0 or < 0 |
+
+Analyze per window as mean(trS) / mean(G2), never as the mean of `gns_B`: `analyze_dynamics.py` writes `gns.md`
+(500-step windows, block types, a half-window agreement check, the training batch / B ratio). Tokens within a
+sequence are correlated, so compare B with the batch in the same unit and prefer trends. B_simple is exact for SGD
+with H ∝ I; for Adam- or Muon-type optimizers it is the standard proxy. Test: `python tests/test_grad_noise.py`
+(linear regression, exact B).
 
 **Gradient**
 

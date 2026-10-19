@@ -1394,3 +1394,221 @@ branch from each. R(S) = branch final eval.
   carries ~0.07 more removable loss late in training, so stable-phase evals understate it (step 8000: AdamW 0.021 lower
   stable, 0.045 higher after decay).
 - 6b seed noise, NorMuon: 0.0033 (2.98197 / 2.98527; mean 2.9836, ties Muon's 2.983). AdamW same-seed repeat: 0.003.
+
+## 2026-10-19 — 1B model at 1B tokens with optimizer dynamics: proxy findings, and a 30% decay (D1-D3)
+
+All runs: train.py defaults (doc packing, `--batch_ramp 32:0.5,64`, 2,860 steps, WSD 2% warmup), 1B tokens,
+`--dyn_every 50`, W&B `bendoris0509-.../llama3.2-1b-optim-dynamics`. Plots / phase tables: `plots/dyn_main1b/`
+(10% decay group), `plots/dyn_main1b_decay0.3/` (30% group). AdamW LR 3e-4 = the only LR tuned for AdamW on this model
+(2M batch, grid edge), so AdamW is likely under-tuned here. New flag `--decay_type {linear,1-sqrt,cosine}`.
+
+| Run (job, W&B) | Optimizer | Decay | Pre-decay eval | Final eval | Decay gain | Wall time |
+|---|---|---|---|---|---|---|
+| `normuon-default-1b-dyn` (570076, i2eejmyt) | NorMuon 0.01 + AdamW 3e-3 | 10% linear | 3.0968 (2574) | 2.9324 | 0.164 | 1:35 h |
+| `soap3e-3-normwd-1b-dyn` (570077, s9br4vew) | SOAP 3e-3, norm wd | 10% linear | 3.1045 (2574) | 2.9545 | 0.150 | 1:40 h |
+| `adamw3e-4-1b-dyn` (570178, hsgomr52) | AdamW 3e-4, norm wd | 10% linear | 3.2995 (2574) | 3.1886 | 0.111 | 1:22 h |
+| D1 `normuon-decay0.3-1b-dyn` (570175, jlvraepc) | NorMuon | 30% linear | 3.2067 (2002) | **2.9101** | 0.297 | 1:32 h |
+| D2 `normuon-decay0.3-1sqrt-1b-dyn` (570176, 3ldi2uxu) | NorMuon | 30% 1−sqrt | 3.2102 (2002) | **2.9080** | 0.302 | 1:34 h |
+| D3 `adamw3e-4-decay0.3-1b-dyn` (570177, w75972wm) | AdamW 3e-4 | 30% linear | 3.4572 (2002) | 3.2100 | 0.247 | 1:22 h |
+
+**Run-to-run noise is larger than assumed.** The NorMuon and SOAP runs repeat 566172 / 566175 exactly (same flags,
+seed 42; only `--dyn_every` differs, which does not touch training): NorMuon 2.9454 → 2.9324 (−0.013), SOAP 2.9522 →
+2.9545 (+0.002). The two NorMuon curves agree within 0.005 until step 2288, then split at the end of the high-LR
+batch-64 phase (step 2431: +0.031, a bump in this run that 566172 doesn't have) and through the decay. Use the
+2-run means: NorMuon 10% **2.9389**, SOAP **2.9534**; treat ~0.013 as the spread of a single 1B-token run's final eval.
+
+- **30% decay helps NorMuon: D1 −0.029, D2 −0.031 vs the NorMuon mean** (−0.022 / −0.024 vs the better run), about
+  2x the spread above; one run each. Linear vs 1−sqrt: tie (0.002). Neither 30% run shows the late-stable bump: their
+  LR is already decaying from step 2002.
+- **AdamW goes the other way: 30% is +0.021 worse** (3.2100 vs 3.1886). At 3e-4 AdamW is 0.25 behind NorMuon and still
+  far from converged, so it loses more from the shorter stable phase than it gains from the decay. As predicted by the
+  proxy's Stage B (NorMuon's decay "noise floor" is larger), but the control is weak: an under-tuned AdamW.
+- **SOAP vs NorMuon at 1B: +0.015 (means)**, larger than the +0.007 of the single earlier pair; SOAP still loses most
+  in the decay (gain 0.150 vs 0.164).
+
+**Proxy findings on the 1B model** (stable-phase medians, global unless noted; proxy values from 2026-10-18):
+
+| Finding | Proxy (1b) | 1B model |
+|---|---|---|
+| NorMuon oscillates (grad cos, consecutive steps) | −0.52 | −0.24 (norm −0.87, attn_v −0.32) |
+| ... and stops in the decay | −0.04 | +0.004 |
+| SOAP doesn't oscillate | +0.20 | +0.24 |
+| AdamW about neutral | 0.00 | +0.06 |
+| Update effective rank NorMuon / SOAP / AdamW | 0.96 / 0.67 / 0.34 | 0.94 / 0.65 / 0.22 |
+| NorMuon flattens row norms (upd_row_cv mlp_up / attn_q; SOAP for reference) | 0.028 / 0.014 (SOAP 0.12 / 0.09) | 0.032 / 0.015 (SOAP 0.18 / 0.11) |
+| Normalized overshoot highest in attn_v | NorMuon 0.38 (Stage A) | NorMuon 0.17; also SOAP 0.13, AdamW 0.42 |
+
+- Every qualitative pattern holds. NorMuon's oscillation is weaker on the 1B model (−0.24 vs −0.52) but present in every
+  block, strongest in the norms and attn_v, and gone in the decay. In D1's long linear decay it fades slowly (decay
+  median −0.06); in D2's 1−sqrt decay, which cuts the LR faster, it is gone (+0.03).
+- SOAP's updates are the least aligned with −g (0.063 vs NorMuon 0.135, AdamW 0.206) and it has the lowest
+  normalized overshoot in attention.
+- AdamW's low update rank is more extreme (0.22; attn_o 0.11), plausibly because its LR is low.
+
+**Follow-up: SOAP with D2's schedule** (`soap3e-3-decay0.3-1sqrt-1b-dyn`, 571179, sbnvb681; SOAP 3e-3, norm wd,
+`--decay_frac=0.3 --decay_type=1-sqrt`, 1:40 h): **2.9427** vs D2 NorMuon 2.9080 (**+0.035**). Pre-decay (step 2002)
+3.2287 vs 3.2102 (+0.019); decay gain 0.286 vs 0.302. The longer decay helps SOAP only −0.011 vs its 10% mean 2.9534
+(within the ~0.013 spread), NorMuon −0.031: on equal terms the gap widens from +0.015 to +0.035. SOAP's smaller decay
+gain persists with a 3x longer decay.
+
+## 2026-10-19 — Stage A optimizer variants on the 1B model at 3B tokens
+
+train.py defaults (NorMuon 0.01 + AdamW 3e-3, norm wd, `--batch_ramp 32:0.5,64`, 10% linear decay, 8,583 steps) + one
+variant each, 3B tokens, no dynamics, team W&B. Baseline: `normuon-default-3b-soapcmp` (566892). On this model q splits
+into 32 heads, k / v into 8 (head dim 64). 571417 (splitkv) died on a bad GPU (25a-hgpn071, now excluded); rerun 571556.
+
+| Run (job, W&B) | Flag | Eval @ 1.13B | Pre-decay (7722) | Final | Δ final | Wall time |
+|---|---|---|---|---|---|---|
+| baseline (566892, k9k39bp7) | — | 3.1464 | 2.9154 | 2.7075 | | 2:36 h |
+| `normuon-splitkv-3b` (571556, xhx5c7r9) | `--muon_split_heads=kv` | 3.1423 | 2.9140 | 2.7063 | −0.001 | 2:38 h |
+| `normuon-splitqkv-3b` (571418, y8dec255) | `--muon_split_heads=qkv` | 3.1393 | 2.9131 | 2.7037 | −0.004 | 2:47 h |
+| `normuon-kv0.5-3b` (571419, 7bdebclk) | `--muon_lr_mult_kv=0.5` | 3.1414 | 2.9082 | 2.7049 | −0.003 | 2:41 h |
+| `normuon-normlr1e-3-3b` (571420, sz3wjwuq) | `--norm_lr=1e-3` | 3.1555 | 2.9176 | 2.7096 | +0.002 | 2:37 h |
+| `normuon-soapembed-3b` (571422, vwzwjtd4) | `--embed_optimizer=soap` | 3.1507 | 2.9196 | 2.7112 | +0.004 | 2:52 h |
+
+- **All five are within ±0.004 of the baseline**, far inside the ~0.013 spread of a single run's final eval (same-flag
+  repeats, 2026-10-19). The proxy's verdict holds on the 1B model at 3x the tokens: no loss effect.
+- The ordering matches the proxy (splitqkv best, norm_lr / soapembed worst), but every gap is noise-sized.
+- Costs: splitqkv +7% time, soapembed +10%, the rest ≈ baseline. Keep the defaults.
+
+## 2026-10-19 — Do loss-matched proxies with different weight ranks differ on tasks? (lm-evaluation-harness)
+
+1B-token proxies (174M, batch 128). lm-eval 0.4.13 (separate venv `/work/$USER/venvs/lmeval`), `eval_harness.sbatch`,
+bf16, results in `/work/$USER/harness/`. Weight ranks from the final weights (`weight_ranks.py`, stable rank, mean over
+layers). NorMuon `--seed=1` is the seed-noise control; AdamW is the low-rank model, but its loss is 0.1 worse.
+
+| Model | Eval loss | Stable rank embed / q / k / gate |
+|---|---|---|
+| NorMuon (566231) | 3.239 | 2.7 / 67 / 36 / 163 |
+| NorMuon seed 1 (566904) | 3.237 | 2.7 / 68 / 34 / 167 |
+| NorMuon + SOAP embed (567070) | 3.240 | 8.0 / 68 / 36 / 158 |
+| SOAP 4e-3 norm wd (565034) | 3.236 | 9.8 / 82 / 60 / 155 |
+| AdamW (bs128) | 3.336 | 2.2 / 30 / 18 / 25 |
+
+Accuracy, % (± ≈ stderr; acc_norm for ARC-C / HellaSwag, acc otherwise):
+
+| Task | NorMuon | NorMuon s1 | SOAP embed | SOAP | AdamW | ± |
+|---|---|---|---|---|---|---|
+| MMLU 0-shot | 22.9 | 23.0 | 23.0 | 23.1 | 23.0 | 0.35 |
+| MMLU 5-shot | 25.1 | 26.5 | 25.5 | 26.8 | 25.7 | 0.37 |
+| MMLU cloze (`mmlu_continuation`) | 25.3 | 24.9 | 25.3 | 24.9 | 25.0 | 0.37 |
+| ARC-Easy | 43.8 | 45.1 | 45.2 | 44.2 | 42.0 | 1.0 |
+| ARC-Challenge | 24.4 | 22.8 | 22.2 | 23.1 | 23.6 | 1.2 |
+| HellaSwag | 28.9 | 29.2 | 29.1 | 29.0 | 28.1 | 0.45 |
+| PIQA | 60.7 | 59.8 | 60.9 | 60.6 | 58.7 | 1.1 |
+| SciQ | 73.5 | 73.3 | 73.6 | 74.4 | 70.2 | 1.4 |
+| LAMBADA (ppl) | 28.2 (71) | 28.3 (75) | 27.5 (74) | 27.4 (75) | 24.6 (115) | 0.6 |
+| Winogrande | 48.7 | 50.4 | 50.0 | 48.8 | 48.5 | 1.4 |
+
+- **MMLU is at chance at this scale, in every format**: 0-shot 23% (below 25%: answer-letter bias), cloze 25%. 5-shot
+  moves 25-27%, but the two NorMuon seeds differ by 1.4 points (4x stderr): few-shot letter-format noise, not knowledge.
+- **The loss-matched models are indistinguishable on every task**: each SOAP / SOAP-embed score is inside the NorMuon
+  seed pair's spread or within ~1 stderr of it. A 3-4x higher embedding rank and 1.2-1.7x higher q / k ranks don't
+  show up in any task here.
+- **Tasks track the loss**: AdamW (+0.1 loss) is lowest on LAMBADA (−3.6 pts, ppl 115 vs 71-75), SciQ (−3), PIQA (−2),
+  ARC-E (−2), HellaSwag (−1). So the benchmarks can resolve a 0.1 loss gap, but find nothing between rank-different
+  models at equal loss.
+
+### Follow-up: 3B main models, and loss split by token frequency / source (`loss_breakdown.py`)
+
+**Loss breakdown.** `loss_breakdown.py`: per-token loss on val.bin (10k held-out docs, 15.2M tokens; window 2048 for
+the proxies, 8192 for the 1B model), bucketed by the target token's count per 1B train tokens (first 1B of train.bin)
+and by source / domain; Δ vs NorMuon with a paired 95% bootstrap CI over docs (doc sampling only, not seed noise).
+Full tables: `results/loss_breakdown_proxy.md`, `results/loss_breakdown_3b.md`. `scoring.score_stream` gained an
+optional per-token output (`tok_loss`; default behavior unchanged).
+
+Proxies (1B tokens), Δ loss vs NorMuon:
+
+| Bucket | Share | Seed 1 | SOAP embed | SOAP | AdamW |
+|---|---|---|---|---|---|
+| target count < 1e3 | 5.4% | −0.012 (CI −0.035, +0.004) | **−0.033** (−0.052, −0.005) | **−0.040** (−0.049, −0.032) | +0.196 |
+| 1e3-1e4 | 13.6% | +0.000 | −0.005 | −0.003 | +0.164 |
+| 1e4-1e6 | 43% | −0.002 | **+0.005 / +0.007** | +0.003 | +0.14 / +0.09 |
+| ≥ 1e6 | 38% | −0.005 / +0.001 | +0.001 / +0.003 | −0.007 / −0.006 | +0.05 / +0.03 |
+| code | 7.0% | −0.006 | **−0.015** | **−0.019** | +0.139 |
+| web (cc) | 77.5% | −0.001 | +0.001 | −0.002 | +0.097 |
+| all | | −0.002 | +0.001 | −0.004 | +0.097 |
+
+- On the proxy the higher-rank embedding **reshapes** the loss: better on the rarest tokens (−0.03 to −0.04, beyond the
+  seed pair) and on code (2.5-3x the seed difference), slightly worse on mid-frequency tokens, net ≈ 0. Benchmarks and
+  mean loss hide this.
+
+1B model (3B tokens), Δ loss vs NorMuon (2.6926). No seed control: the four Stage A variants that changed nothing
+else (splitqkv, splitkv, kv0.5, normlr) give the spread.
+
+| Bucket | splitqkv | splitkv | kv0.5 | normlr | SOAP embed | SOAP |
+|---|---|---|---|---|---|---|
+| < 1e3 | −0.010 | +0.001 | −0.001 | +0.009 | **−0.000** (−0.010, +0.016) | −0.013 |
+| 1e3-1e6 | −0.004…−0.008 | −0.001…−0.003 | −0.003…−0.004 | +0.001…+0.003 | +0.004…+0.006 | −0.005…−0.007 |
+| ≥ 1e6 | 0.000 | 0.000 | −0.001 | +0.002 | +0.002 | −0.004…−0.008 |
+| code | −0.005 | −0.000 | −0.002 | +0.004 | +0.003 | −0.006 |
+| all | −0.004 | −0.001 | −0.003 | +0.002 | +0.004 | −0.006 |
+
+- **The proxy's trade-off is gone at 3B**: SOAP-embed's embedding rank is still 4.4x NorMuon's (stable rank 18.8 vs
+  4.2), but it is no better on rare tokens or code and slightly worse everywhere. SOAP and splitqkv are level shifts,
+  larger in absolute terms on the high-loss rare tokens, i.e. no rank-specific signature.
+- Weight stable ranks at 3B (`weight_ranks.py`): embed NorMuon 4.2, SOAP 18.7, SOAP-embed 18.8; splitqkv cuts attn_q
+  157 → 45 and attn_k 63 → 25 (splitkv: k 33), with a −0.004 loss change. Large rank changes, no loss consequence.
+
+**Benchmarks, 1B model at 3B tokens** (lm-eval, `BATCH=16`: 64 runs out of memory on the 128k-vocab logits), %:
+
+| Task | NorMuon | splitqkv | splitkv | kv0.5 | normlr | SOAP embed | SOAP | ± |
+|---|---|---|---|---|---|---|---|---|
+| MMLU 0-shot | 23.5 | 25.1 | 26.0 | 23.1 | 25.4 | 25.8 | 25.7 | 0.37 |
+| MMLU 5-shot | 24.1 | 25.3 | 24.8 | 23.8 | 23.5 | 25.1 | 25.9 | 0.37 |
+| MMLU cloze | 26.9 | 26.9 | 26.9 | 27.0 | 27.0 | 26.9 | 27.0 | 0.37 |
+| ARC-Easy | 55.9 | 55.2 | 55.7 | 56.1 | 56.1 | 55.6 | 54.3 | 1.0 |
+| ARC-Challenge | 26.2 | 27.3 | 26.9 | 28.0 | 26.5 | 27.2 | 27.4 | 1.3 |
+| HellaSwag | 37.4 | 37.9 | 37.8 | 37.5 | 37.6 | 37.7 | 37.8 | 0.5 |
+| PIQA | 65.1 | 66.7 | 65.3 | 66.1 | 65.2 | 65.9 | 65.8 | 1.1 |
+| SciQ | 83.6 | 84.0 | 84.2 | 85.6 | 83.0 | 84.5 | 85.3 | 1.1 |
+| LAMBADA | 40.0 | 39.6 | 39.5 | 40.8 | 39.2 | 38.9 | 40.4 | 0.7 |
+| Winogrande | 53.2 | 51.1 | 52.0 | 50.7 | 52.4 | 52.2 | 53.5 | 1.4 |
+
+- MMLU is still at chance at 1.2B params / 3B tokens (cloze 27% for all; the multiple-choice 23-26% spread is
+  answer-format noise: the null variants span 23.1-26.0).
+- Every SOAP / SOAP-embed score lies inside the range of the four null variants. No task separates the rank-different
+  models; the tasks have resolution (vs the 1B-token proxies: ARC-E 44 → 56, HellaSwag 29 → 37,
+  SciQ 74 → 84, LAMBADA 28 → 40), just no model effect.
+
+## 2026-10-19 — Stage E: gradient noise scale and a second batch ramp (Llama-3.2-1B, 1B tokens)
+
+New: `--dyn_noise` (GradNoiseScale in `llama_train/optim_dynamics.py`, README "Gradient noise scale"): every
+`--dyn_every` steps each rank takes two fresh micro-batches (train.bin blocks past the end of the ramp sampler's
+permutation: never trained on) and logs per block type G2 = g1·g2, trS = b((|g1|²+|g2|²)/2 − g1·g2), B = trS/G2 in
+tokens, averaged over the 8 ranks. Test `tests/test_grad_noise.py` (linear regression, exact B 9.48): 9.50. GPU smoke test
+(100 steps, seed 0, with / without): train loss within 0.02 at every logged step, final eval 5.806 / 5.804, ~5 s per
+measurement (≈ 1 training step, ~2% at every 50). `analyze_dynamics.py` writes `gns.md` (window mean(trS)/mean(G2),
+half-window check).
+
+Runs (30% 1−sqrt decay, step units, dynamics + noise, personal W&B `llama3.2-1b-optim-dynamics`); full table in
+`results/STAGE_E.md`:
+
+| Run | Batch schedule | Steps | Final eval |
+|---|---|---|---|
+| `normuon-decay0.3-1sqrt-1b-dyn` (Stage D, `3ldi2uxu`) | 32:0.5,64 | 2,860 | 2.9080 |
+| `normuon-decay0.3-1sqrt-1b-dyn-gns-s1` (E1, `9hg351ju`) | 32:0.5,64 | 2,860 | 2.9100 |
+| `normuon-decay0.3-1sqrt-ramp128-1b-dyn-gns` (E2c, `s2wuxb2e`) | 32:0.5,64:0.1,128 | 2,478 | 2.9565 |
+| `normuon-decay0.3-1sqrt-ramp128-1b-dyn-gns-s1` (E2c, `5xvihssq`) | 32:0.5,64:0.1,128 | 2,478 | 2.9525 |
+
+- **Seed noise with the 30% decay is small**: 2.9080 / 2.9100 (0.002), E2c pair 0.004, vs 0.013 for the 10%-decay
+  NorMuon pair. One pair each, but the longer decay looks like it also removes run-to-run spread.
+- **A second ramp to 128 at 60% costs 0.045** (both seeds). The evals match the baseline step for step until E2c's
+  decay starts (step ~1,720: 3.346 / 3.339 vs 3.343), so the loss comes from the last 40% of the tokens. Confounded with
+  the step-unit decay: E2c's decay starts at step 1,735 (455M tokens, still batch 32) and has 743 optimizer steps; the
+  baseline's has 858, all at batch 64, from 550M tokens. A clean test needs `--decay_frac 0.192` for E2c (decay from
+  step 2,002 = 550M tokens, as in the baseline).
+- **B_noise grows through training** (global, pooled over the three runs, which train identically up to step 1,735,
+  90% bootstrap CI): 123k tokens [92k, 177k] at steps 100-300, 292k [229k, 381k] at 300-700, 352k [293k, 426k] at
+  700-1,100, 479k [398k, 581k] at 1,500-1,700; in the decay 1.7M (2,100-2,350) and 3.4M (2,350-2,860) as |G|² falls.
+  Batch 32 (262k) is about B from step ~400 on; B reaches the batch-64 size (524k) at ~1,600-1,900 steps, i.e. 0.42-0.5
+  of the tokens: **the timing rule "double when B reaches the next batch" lands in the flat optimum (0.33-0.67) found by
+  the switch-point sweep** (2026-10-16), so E2b would not change the default.
+- By block: attn_v has the smallest B (146k-301k), mlp_gate/up the largest (0.5-1.2M), embed ≈ global.
+- **B_simple does not predict E2c**: in the decay B is 2-10x the 1M-token batch, so by McCandlish et al. batch 128
+  should have been nearly free; it cost 0.045. Either B_simple overstates the critical batch for NorMuon in the decay
+  (it is exact only for SGD with H ∝ I, and the decay's B rise is |G|² → 0, not more noise), or the decay confound above
+  explains it. The `--decay_frac 0.192` pair separates the two.
+- Precision: with one run, 10 measurements per 500-step window, the half-window estimates disagree by more than 30% in
+  most stable windows (one G2 ≈ 0 measurement can dominate a window). Pooling 3 runs fixes it; for single runs measure
+  more often (every 25 steps: ~4% overhead).

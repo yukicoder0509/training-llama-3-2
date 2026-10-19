@@ -10,6 +10,7 @@ Stages from the WSD schedule (--warmup_frac / --decay_frac of --max_steps): warm
   <out>/summary.md          medians per stage, run and block type for every metric
   <out>/phases.md           medians over step windows (--gate, stable, decay) incl. overshoot D1/grad_norm and the
                             fraction of D1 > 0, deltas vs --baseline; with --logs NAME=slurm.out (one per run) also eval losses
+  <out>/gns.md              (--dyn_noise runs) gradient noise scale per --gns_window steps and block type, half-window check
 """
 
 import argparse
@@ -48,6 +49,8 @@ ap.add_argument("--baseline", default=None, help="phases.md: run NAME to subtrac
 ap.add_argument("--logs", action="append", default=[], help="NAME=slurm log for eval losses (phases.md); repeat per run")
 ap.add_argument("--tokens_per_step", type=int, default=262144, help="eval steps from tokens (proxy: 262144 at batch 128, 524288 at 256)")
 ap.add_argument("--noise", type=float, default=0.004, help="flag |final − baseline| below this")
+ap.add_argument("--gns_window", type=int, default=500, help="gns.md (--dyn_noise runs): window in steps for B_noise")
+ap.add_argument("--gns_tol", type=float, default=0.3, help="gns.md: the two half-window estimates must agree within this")
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 
@@ -239,4 +242,41 @@ for m in PHASE_METRICS:
             if any(cells):
                 plines.append(f"| {blk} | " + " | ".join(cells) + " |")
 open(os.path.join(a.out, "phases.md"), "w").write("\n".join(plines) + "\n")
+
+
+# --dyn_noise: B_noise per window = mean(gns_trS) / mean(gns_G2) (never the mean of per-point gns_B: one G2 can be ~0 or
+# < 0), in tokens, with the same ratio over each half of the window as a precision check (trust if within --gns_tol).
+def gns_tables(name, df):
+    sub = df[df.metric.isin(["gns_trS", "gns_G2", "gns_batch"]) & df.scope.isin(["global", "type"])].copy()
+    if sub.empty:
+        return []
+    sub["block"] = np.where(sub.scope == "global", "global", sub.type)
+    wide = sub.pivot_table(index=["block", "step"], columns="metric", values="value")
+    batch = wide.loc["global", "gns_batch"] if "gns_batch" in wide else None
+    steps = sorted(wide.index.get_level_values("step").unique())
+    edges = list(range(0, max(steps) + a.gns_window, a.gns_window))
+    lines = [f"\n## {name}\n", "| steps | block | n | B_noise (tokens) | 1st half | 2nd half | halves agree | train batch (tokens) | batch / B |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        for blk in ["global"] + [t for t in types_seen if t in wide.index.get_level_values("block")]:
+            part = wide.loc[blk]
+            part = part[(part.index > lo) & (part.index <= hi)].dropna(subset=["gns_trS", "gns_G2"])
+            if len(part) < 2:
+                continue
+            ratio = lambda p: p.gns_trS.mean() / p.gns_G2.mean() if p.gns_G2.mean() > 0 else float("nan")
+            B, h1, h2 = ratio(part), ratio(part.iloc[:len(part) // 2]), ratio(part.iloc[len(part) // 2:])
+            ok = math.isfinite(h1 * h2) and abs(h1 - h2) <= a.gns_tol * (h1 + h2) / 2
+            bt = batch[(batch.index > lo) & (batch.index <= hi)].mean() if batch is not None else float("nan")
+            lines.append(f"| {lo + 1}-{hi} | {blk} | {len(part)} | {B:,.0f} | {h1:,.0f} | {h2:,.0f} | {'yes' if ok else 'NO'} "
+                         f"| {bt:,.0f} | {bt / B:.2f} |")
+    return lines
+
+
+glines = sum((gns_tables(n, df) for n, df in runs.items()), [])
+if glines:
+    open(os.path.join(a.out, "gns.md"), "w").write(
+        f"# Gradient noise scale B_noise = tr(Sigma) / |G|^2 (McCandlish et al. 2018, B_simple)\n\n"
+        f"Per {a.gns_window}-step window: mean(gns_trS) / mean(gns_G2), in tokens (treats tokens as independent: compare "
+        f"with the training batch in the same unit, prefer trends). Halves agree: within {a.gns_tol:.0%}. batch / B < 1: "
+        f"a larger batch is nearly free; > 1: tokens are wasted on noise reduction.\n" + "\n".join(glines) + "\n")
 print("wrote", a.out)

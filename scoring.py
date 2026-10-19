@@ -21,11 +21,13 @@ def group_name(source, topic):  # the groups of percentiles.csv: cc:<topic>, pdf
 
 
 @torch.no_grad()
-def score_stream(model, tokens, doc_start, window=2048, batch_tokens=65536, log=print):
+def score_stream(model, tokens, doc_start, window=2048, batch_tokens=65536, log=print, tok_loss=None):
     """Per-doc (loss sum, predictions) for docs tokens[doc_start[i]:doc_start[i+1]] (tokens: any int array, e.g. a memmap).
 
     Each doc is split into <= window-token windows scored on their own (FlashAttention varlen, positions restart per
     window); a window's last token has no target. The windows tile the stream, so a batch is a contiguous slice.
+    tok_loss: optional float32 CUDA tensor of doc_start[-1] - doc_start[0] entries; gets the loss of predicting token
+    j + 1 at entry j (relative to doc_start[0]); entries without a target are left as they are.
     """
     k = len(doc_start) - 1
     n_tok = np.diff(doc_start)
@@ -56,6 +58,9 @@ def score_stream(model, tokens, doc_start, window=2048, batch_tokens=65536, log=
             v, d = valid[c:c + 8192], tok_doc[c:c + 8192]
             loss_sum.index_add_(0, d[v], l[v].double())
             pred.index_add_(0, d[v], torch.ones_like(l[v], dtype=torch.float64))
+            if tok_loss is not None:
+                o = a - int(doc_start[0]) + c
+                tok_loss[o:o + len(l)][v] = l[v]
         b0, nb = b1, nb + 1
         if nb % 1000 == 0:
             log(f"batch {nb}: {(e - doc_start[0]) / total:.1%} of tokens")

@@ -90,6 +90,7 @@ def lr_lambda(args, plan):
     """train.py's own LR factor per step for --lr_schedule wsd2 and --schedule_unit tokens (a LambdaLR), else None: the
     Trainer builds its WSD / cosine scheduler from hf_schedule()."""
     if args.schedule_unit == "tokens":
+        assert args.decay_type == "linear", "--decay_type is implemented for --schedule_unit steps"
         assert args.lr_schedule == "wsd", "--schedule_unit tokens is implemented for --lr_schedule wsd"
         # Warmup over warmup_frac x budget tokens, peak until (1 - decay_frac) x budget, then linear to 0 at the last step.
         # Before the decay the LR depends only on tokens seen and the nominal budget, so the batch ramp can't change it.
@@ -137,7 +138,7 @@ def hf_schedule(args, plan):
     decay_steps = plan.decay_steps
     sched_type = "cosine_with_min_lr" if args.lr_schedule == "cosine" else "warmup_stable_decay" if decay_steps else "constant_with_warmup"
     kwargs = ({"min_lr_rate": args.min_lr_ratio} if args.lr_schedule == "cosine"
-              else {"num_decay_steps": decay_steps, "decay_type": "linear"} if decay_steps else {})
+              else {"num_decay_steps": decay_steps, "decay_type": args.decay_type} if decay_steps else {})
     return sched_type, kwargs, plan.warmup_steps
 
 
