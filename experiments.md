@@ -1636,3 +1636,26 @@ Runs (30% 1−sqrt decay, step units, dynamics + noise, personal W&B `llama3.2-1
   loss at the same LR than on a larger step.
 - Stage E conclusion: keep `32:0.5,64` with LR unchanged; batch 128 and the √2 rule both lose at 1B tokens. B_simple is
   useful for the stable phase (it times the 32 → 64 switch) and misleading in the decay.
+
+## 2026-10-20 — Continuous benchmark metrics (DataDecide-style proxy metrics) vs accuracy
+
+`eval_harness.sbatch` now passes `--log_samples` (per-choice log-likelihoods); `harness_proxy.py` computes per question
+acc, acc_norm, logp_char (log-likelihood per character of the correct answer), prob_norm (probability of the correct
+answer among the choices) and margin_char, and pairs each model with a reference question by question. Rerun on the 5
+proxies and 7 main-model 3B runs, plus `normuon-default-3b-dyn-gns-s1` (seed 1 of `normuon-default-3b-soapcmp`,
+eval 2.7053 vs 2.7075: the first 3B seed control). Tables: `/work/$USER/harness_samples/proxy_metrics.md`.
+
+- The paired stderr covers question sampling only; the seed pairs give |z| up to 42 (proxy) and 35 (3B) on logp_char.
+  Seed gaps are the noise floor, not the z scores.
+- Letter-format MMLU (0/5-shot) continuous metrics measure the letter tokens' calibration: seed gap 0.14 (proxy) and
+  0.05 (3B) nats/char, as large as any model effect. The 3B seed pair also moves MMLU accuracy +2.2 / +2.9 points:
+  the 23-26% spread between 3B variants is seed noise.
+- Proxy, AdamW (+0.10 eval loss) gap / seed gap: HellaSwag logp_char 68 (seed gap 0.0003), LAMBADA acc 45 / logp 14,
+  SciQ acc 16, ARC / PIQA / MMLU cloze ≤ 2. HellaSwag logp_char moves with the loss (AdamW −2.8% vs +3% loss).
+- 3B: the seed pair differs by +0.0035 on HellaSwag logp_char; the six variants differ from seed 0 by +0.0016 to
+  +0.0045, i.e. all within seed noise (seed 0 is the low one). Seed gaps on ARC-E (−0.035), SciQ (−0.089) and MMLU cloze
+  (+0.017) logp_char exceed every variant's. No metric separates the 3B variants; proxy-to-3B prediction cannot be
+  tested on variants with no 3B effect. The proxy's 0.0003 HellaSwag seed gap was likely lucky.
+- Conclusion: continuous metrics are not more informative than eval loss here. HellaSwag logp_char and LAMBADA are
+  the least noisy tasks, both track the loss. Testing DataDecide's claim needs pairs with real 3B gaps (e.g. AdamW at 3B)
+  and more than one seed per side.

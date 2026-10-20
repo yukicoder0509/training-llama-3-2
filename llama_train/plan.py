@@ -3,6 +3,7 @@
 No GPU or model needed (tests/plan_dump.py runs it on the CPU).
 """
 
+import json
 import os
 
 import torch
@@ -64,13 +65,21 @@ def make_plan(args, world_size):
         # The Trainer's grad accum is fixed: enough micro-batches for the largest batch at --per_device_batch; smaller
         # batches use smaller micro-batches (one static compile per size)
         grad_accum = -(-max(sizes) // (world_size * args.per_device_batch))
-        assert all(b % (world_size * grad_accum) == 0 for b in sizes), args.batch_ramp
         ramp = [(b, int(t // (b * block_size))) for b, t in zip(sizes, stage_toks)]
         if args.max_steps:  # short tests: keep the stage proportions in steps
             total = sum(n for _, n in ramp)
             ramp = [(b, max(1, round(n * args.max_steps / total))) for b, n in ramp]
         max_steps = sum(n for _, n in ramp)
-        per_device_batch = sizes[0] // (world_size * grad_accum)
+        # A stage whose batch is not a multiple of GPUs x accum (e.g. 32 with accum 8 for a later 256) is allowed only
+        # before the --resume_from step: a branch skips those steps (RampBatchSampler still yields their indices,
+        # unevenly split), it never trains them
+        uneven = [i for i, b in enumerate(sizes) if b % (world_size * grad_accum)]
+        if uneven:
+            resume_step = (json.load(open(os.path.join(args.resume_from, "trainer_state.json")))["global_step"]
+                           if args.resume_from else 0)
+            assert sum(n for _, n in ramp[:max(uneven) + 1]) <= resume_step, \
+                f"{args.batch_ramp}: batches {[sizes[i] for i in uneven]} are not multiples of {world_size} GPUs x accum {grad_accum}"
+        per_device_batch = next(b for b in sizes if b % (world_size * grad_accum) == 0) // (world_size * grad_accum)
         print("Batch ramp:", ", ".join(f"{b} x {n} steps = {b * n * block_size / 1e9:.3g}B tokens ({b // (world_size * grad_accum)}/GPU)" for b, n in ramp),
               f"x grad accum {grad_accum}")
 
@@ -180,8 +189,7 @@ class RampBatchSampler:
         sizes = [b for b, k in self.ramp for _ in range(k)] + [self.ramp[-1][0]] * self.tail_steps
         pos = 0
         for b in sizes:
-            m = b // (self.world * self.accum)
-            for _ in range(self.accum):
-                for r in range(self.world):
-                    yield perm[pos : pos + m]
-                    pos += m
+            k = self.world * self.accum
+            for j in range(k):  # b % k != 0 only for steps a resumed branch skips (make_plan checks)
+                yield perm[pos + j * b // k : pos + (j + 1) * b // k]
+            pos += b
