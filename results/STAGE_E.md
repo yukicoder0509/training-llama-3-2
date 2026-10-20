@@ -29,3 +29,36 @@ Gradient noise scale (B_simple, tokens; pooled over the 3 runs, identical traini
 (1101-1500 omitted: one measurement with G2 ≈ 0 makes the window ratio unstable, CI 0.35-5.5M.) The plan's precision
 check fails at 10 measurements per 500-step window in one run (halves disagree > 30% in most stable windows); pooling 3
 runs gives usable CIs. Plots and tables: `plots/stageE_e1/`, `plots/stageE_e2c/` (`gns.md`, `phases.md`).
+
+## Follow-up (2026-10-19): E2c' (decay-matched) and E4 (LR x √2 at the ramp)
+
+| Run | W&B | Job | Final eval | Δ vs 2.9090 |
+|---|---|---|---|---|
+| E2c' `normuon-decay0.192-1sqrt-ramp128-1b-dyn-gns` | `dtvc9be6` | 575799 | 2.9295 | +0.021 |
+| E2c' `…-s1` | `1kbw92mb` | 575800 | 2.9323 | +0.023 |
+| E4 `normuon-decay0.3-1sqrt-ramplr1.41-1b-dyn-gns` | `9po7x95j` | 575829 | 2.9264 | +0.017 |
+| E4 `…-s1` | `zvsqvsxf` | 575830 | 2.9211 | +0.012 |
+
+Decisions: E2c' rejected (half of E2c's loss was the decay confound, the rest is the second ramp); E4 rejected. Keep
+`32:0.5,64`, LR unchanged. B_noise jumps ~5x at the decay start (LR-driven), so it cannot time switches inside the decay.
+
+## 3B run with noise measurement (2026-10-20)
+
+`normuon-default-3b-dyn-gns-s1` (W&B `5h5zj9mo`, job 576372): 3B defaults (32:0.5,64, 10% linear decay from step 7,725 =
+2.55B tokens), `--seed 1 --dyn_every 25 --dyn_noise`. Final eval **2.7053** (seed 0, job 566892: 2.7075).
+
+B_simple per phase (tokens; ratio of window means, 90% bootstrap CI; batch 32 = 262k, 64 = 524k, 128 = 1.05M tokens):
+
+| Steps | Tokens | B | 90% CI |
+|---|---|---|---|
+| 1-500 | 0-0.13B | 81k | [61, 125] |
+| 501-1000 | 0.13-0.26B | 443k | [336, 600] |
+| 1001-2000 | 0.26-0.52B | 565k | [454, 713] |
+| 2001-3000 | 0.52-0.79B | 485k | [417, 566] |
+| 4001-5000 | 1.05-1.31B | 585k | [385, 924] |
+| 6701-7725 (batch 64) | 2.01-2.55B | 498k | [422, 614] |
+| decay 7726-8583 | 2.55-3.0B | 1.35M | [1.07, 1.78] |
+
+Windows 3001-4000, 5001-5722 and 5723-6700 are dominated by a few near-zero G2 measurements (CIs reach 3-10M); their
+500-step medians of per-point B are 0.42-0.56M. B plateaus at ~0.45-0.55M tokens (≈ batch 64) from ~0.25B tokens to the
+decay start and does not grow; it never reaches the batch-128 size (1.05M) in the stable phase.

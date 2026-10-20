@@ -1612,3 +1612,27 @@ Runs (30% 1−sqrt decay, step units, dynamics + noise, personal W&B `llama3.2-1
 - Precision: with one run, 10 measurements per 500-step window, the half-window estimates disagree by more than 30% in
   most stable windows (one G2 ≈ 0 measurement can dominate a window). Pooling 3 runs fixes it; for single runs measure
   more often (every 25 steps: ~4% overhead).
+
+### Stage E follow-up: decay-matched second ramp (E2c') and LR x √2 at the ramp (E4)
+
+| Run | W&B | Change vs baseline (32:0.5,64, 30% 1−sqrt) | Final eval | Δ vs 2.9090 |
+|---|---|---|---|---|
+| `normuon-decay0.192-1sqrt-ramp128-1b-dyn-gns` | `dtvc9be6` | 32:0.5,64:0.1,128, `--decay_frac 0.192` (decay from step 2,003 = 550M tokens, as the baseline) | 2.9295 | +0.021 |
+| `…-s1` | `1kbw92mb` | same, `--seed 1` | 2.9323 | +0.023 |
+| `normuon-decay0.3-1sqrt-ramplr1.41-1b-dyn-gns` | `9po7x95j` | `--ramp_lr_mult 1.414` (NorMuon LR 0.01 → 0.0141 at step 1,908) | 2.9264 | +0.017 |
+| `…-s1` | `zvsqvsxf` | same, `--seed 1` | 2.9211 | +0.012 |
+
+- **Matching the decay halves E2c's loss but does not remove it**: 0.045 → 0.022 (seed pairs agree within 0.003). Batch
+  128 from step 2,097 costs 0.022 although B_noise there is 1.4-2.7M tokens (> the 1.05M batch). The decay has the same
+  tokens but 475 optimizer steps instead of 858: in the decay, steps matter more than per-step noise, and B_simple does
+  not capture that.
+- **B_noise jumps at the decay start, not gradually**: E1 0.27-0.38M before step 2,002, 1.4-1.7M within ~100-300 steps
+  after it (1−sqrt cuts the LR 30% in the first 86 steps). E2c (decay from 1,735) rose correspondingly earlier. The rise
+  is |G|² collapsing as the LR falls, so in the decay B reflects the LR schedule, not a larger usable batch. In the
+  stable phase B stays < 0.6M: the noise-scale rule supports 32 → 64 at ~0.4-0.5 of the tokens, never 128 at 1B tokens.
+- **LR x √2 at the batch doubling hurts** (+0.015 mean). The higher LR raises the pre-decay eval (3.257 / 3.250 vs
+  3.210 / 3.205 at step 2,002) and lowers B right after the switch (0.09-0.18M vs 0.27M: larger |G|² away from the
+  valley floor); the decay recovers most but not all of it. The bigger batch's lower noise is better spent on lower
+  loss at the same LR than on a larger step.
+- Stage E conclusion: keep `32:0.5,64` with LR unchanged; batch 128 and the √2 rule both lose at 1B tokens. B_simple is
+  useful for the stable phase (it times the 32 → 64 switch) and misleading in the decay.
