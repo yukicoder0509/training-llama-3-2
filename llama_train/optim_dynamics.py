@@ -31,6 +31,9 @@ and measures, for every parameter tensor, then aggregates per block type
 GradNoiseScale / GradNoiseCallback (separate, all ranks): gradient noise scale B_simple = tr(Sigma) / |G|^2 from two
 fresh micro-batches at the same weights -> gns_G2, gns_trS, gns_B per group (see the class docstring).
 
+ProbeSharpness / ProbeCallback (separate, all ranks): dir_sharpness without mini-batch noise, from the gradients of a
+fixed probe batch before and after one optimizer step -> probe_sharpness, probe_D1, probe_slope, probe_loss, probe_dloss.
+
 Group values for norms / cosines / curvature are exact: they are computed from summed
 dot products, i.e. as if the group's tensors were flattened into one vector (the
 "global" group reproduces MiniCPM's whole-model definitions). Spectral values are
@@ -40,7 +43,7 @@ Notes
 - dW is the update the optimizer actually applied, so it includes weight decay.
 - Gradients are read where the optimizer reads them (after clipping in HF Trainer).
 - g_a and g_b come from different mini-batches, so dir_sharpness / K contain gradient
-  noise of size ~||noise|| / ||v_a||. Look at medians over many log points, and ignore
+  noise of size ~||noise|| / ||v_a|| (ProbeSharpness measures it without that noise). Look at medians over many log points, and ignore
   them where the LR is near zero (end of decay): there the tiny update makes the noise
   term blow up.
 - Memory: during the window the logger holds about two extra parameter-sized buffers
@@ -540,6 +543,87 @@ class GradNoiseScale:
 
 
 # ---------------------------------------------------------------------------
+# probe-batch curvature
+# ---------------------------------------------------------------------------
+
+
+class ProbeSharpness:
+    """Directional sharpness along the actual update on a FIXED probe batch: no mini-batch noise.
+
+    The logger's dir_sharpness = (g_b - g_a) . v_a / |v_a|^2 takes g_a and g_b from two different training batches, so
+    it carries a noise term ~ |noise| / |v_a|. Here both gradients come from the same probe batch P (the same at every
+    measurement), around one optimizer step theta_t -> theta_t+1 = theta_t + v:
+        probe_sharpness = (g_P(theta_t+1) - g_P(theta_t)) . v / |v|^2   (~ v^T H_P v / |v|^2, exact for a quadratic)
+        probe_D1        = g_P(theta_t+1) . v / |v|
+        probe_slope     = g_P(theta_t) . v / |v|                         (first-order change of L_P along the step)
+        probe_loss      = L_P(theta_t),  probe_dloss = L_P(theta_t+1) - L_P(theta_t)
+    v is the update the optimizer applied (incl. weight decay). Gradients come from torch.autograd.grad, so p.grad and
+    DDP's hooks are untouched; training is unchanged. Under DDP every rank uses its own probe micro-batches and the dot
+    products are averaged over ranks (v is replicated, so that is the dot product with the rank-mean probe gradient).
+
+    loss_fn(j) -> loss of the j-th probe micro-batch at the current weights (j < n_micro), under the training autocast.
+    Memory: one fp32 copy of the weights and one of the probe gradient between before_step() and after_step().
+    """
+
+    def __init__(self, model: torch.nn.Module, loss_fn: Callable[[int], torch.Tensor], n_micro: int = 1,
+                 rules: list[tuple[str, str]] | None = None):
+        self.loss_fn, self.n_micro = loss_fn, n_micro
+        self.params = [(n, p, *classify(n, p, rules or DEFAULT_RULES)) for n, p in model.named_parameters()
+                       if p.requires_grad]
+        self._g_a = self._w = self._loss_a = None
+
+    def _grad(self) -> tuple[list[torch.Tensor], torch.Tensor]:
+        ps = [p for _, p, _, _ in self.params]
+        acc, loss_sum = None, 0.0
+        for j in range(self.n_micro):
+            loss = self.loss_fn(j)
+            grads = torch.autograd.grad(loss, ps)
+            if acc is None:
+                acc = [g.float() for g in grads]
+            else:
+                for a, g in zip(acc, grads):
+                    a.add_(g.float())
+            loss_sum += loss.detach().double()
+            del loss, grads
+        return [a.div_(self.n_micro) for a in acc], loss_sum / self.n_micro
+
+    def before_step(self) -> None:
+        """Call with the weights theta_t, before optimizer.step()."""
+        self._g_a, self._loss_a = self._grad()
+        self._w = [p.detach().float().clone() for _, p, _, _ in self.params]
+
+    def after_step(self) -> dict:
+        """Call with the weights theta_t+1, after optimizer.step(). Collective under torch.distributed."""
+        g_b, loss_b = self._grad()
+        sums = torch.zeros(len(self.params), 3, dtype=torch.float64, device=self._w[0].device)  # g_a.v, g_b.v, v.v
+        with torch.no_grad():
+            for j, ((_, p, _, _), w, ga, gb) in enumerate(zip(self.params, self._w, self._g_a, g_b)):
+                v = p.detach().float() - w
+                sums[j, 0], sums[j, 1], sums[j, 2] = (ga * v).sum(), (gb * v).sum(), v.pow(2).sum()
+        losses = torch.stack([torch.as_tensor(self._loss_a, dtype=torch.float64, device=sums.device),
+                              torch.as_tensor(loss_b, dtype=torch.float64, device=sums.device)])
+        self._g_a = self._w = self._loss_a = None
+        del g_b
+        stats = torch.cat([sums.reshape(-1), losses])
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+            stats /= torch.distributed.get_world_size()
+        S = stats[:-2].reshape(-1, 3).cpu().tolist()
+        loss_a, loss_b = stats[-2:].tolist()
+        groups: dict[str, list[int]] = defaultdict(list)
+        for j, (_, _, _, typ) in enumerate(self.params):
+            groups["global"].append(j)
+            groups[f"type/{typ}"].append(j)
+        rec: dict = {"global/probe_loss": loss_a, "global/probe_dloss": loss_b - loss_a}
+        for gname, idx in groups.items():
+            gav, gbv, vv = (sum(S[j][k] for j in idx) for k in range(3))
+            rec[f"{gname}/probe_sharpness"] = _safe(_div(gbv - gav, vv))
+            rec[f"{gname}/probe_D1"] = _safe(_div(gbv, math.sqrt(vv)))
+            rec[f"{gname}/probe_slope"] = _safe(_div(gav, math.sqrt(vv)))
+        return rec
+
+
+# ---------------------------------------------------------------------------
 # HF Trainer callback
 # ---------------------------------------------------------------------------
 
@@ -589,6 +673,36 @@ try:
                 return
             self.gns.loss_fn = self.loss_fn_for_step(step)
             rec = {"step": step, "time": time.time(), **self.gns.measure(), **(self.extra_fn(step) if self.extra_fn else {})}
+            if state.is_world_process_zero:
+                if self.out_path:
+                    with open(self.out_path, "a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                if self.log_fn:
+                    self.log_fn({k: v for k, v in rec.items() if v is not None and k not in ("step", "time")}, step)
+
+    class ProbeCallback(TrainerCallback):
+        """ProbeSharpness around the optimizer step that completes step k * every (k >= 1). Attach on EVERY rank (the
+        measurement all-reduces); rank 0 appends the record to out_path and calls log_fn."""
+
+        def __init__(self, loss_fn, every, n_micro=1, out_path=None, log_fn=None):
+            self.loss_fn, self.every, self.n_micro, self.out_path, self.log_fn = loss_fn, every, n_micro, out_path, log_fn
+            self.probe: ProbeSharpness | None = None
+            self.armed = False
+
+        def on_train_begin(self, args, state, control, model=None, **kw):
+            self.probe = ProbeSharpness(model, self.loss_fn, self.n_micro)
+
+        def on_pre_optimizer_step(self, args, state, control, **kw):
+            if self.probe is not None and (state.global_step + 1) % self.every == 0:
+                self.probe.before_step()
+                self.armed = True
+
+        def on_optimizer_step(self, args, state, control, **kw):
+            if not self.armed:
+                return
+            self.armed = False
+            step = state.global_step + 1  # global_step is incremented after this event
+            rec = {"step": step, "time": time.time(), **self.probe.after_step()}
             if state.is_world_process_zero:
                 if self.out_path:
                     with open(self.out_path, "a") as f:

@@ -1659,3 +1659,204 @@ eval 2.7053 vs 2.7075: the first 3B seed control). Tables: `/work/$USER/harness_
 - Conclusion: continuous metrics are not more informative than eval loss here. HellaSwag logp_char and LAMBADA are
   the least noisy tasks, both track the loss. Testing DataDecide's claim needs pairs with real 3B gaps (e.g. AdamW at 3B)
   and more than one seed per side.
+
+## 2026-11-01 — Optimizer dynamics vs peak LR on the proxy (5 optimizers, 6-7 LRs each, 6B tokens)
+
+**Why.** Which dynamics metrics track the LR, and does any of them mark the optimal LR (a turning point or a typical
+value) so that it could flag a bad LR? Setup: 6B proxy runs as in 2026-10-17 (batch 256 x 2048, 11,444 steps, WSD
+2% / 10%, `--dyn_every 50`, norm wd on, default seed); only the peak LR changes (Muon / NorMuon: the matrix LR; their
+AdamW on embedding + norms stays at 3e-3). Baselines are the existing runs 567242 (NorMuon), 561805 (Muon), 563002
+(AdamW), 563152 (SOAP), 563151 (Sophia ρ 0.05, wd 0.2). New: `proxy-dynlr-<opt>-<lr>-6b`, 26 runs: jobs
+669606-669622, 669627-669629 (three resubmitted after an HF Hub 429 at startup when 20 launched at once; later batches
+start 60 s apart) and 669894-669900 (grid extension so each optimizer has ≥ 2 LRs on each side of its 6B optimum).
+New script `analyze_lr_dynamics.py`: medians per window (early 500-1500, stable 500-10250, decay) vs LR / LR_base,
+Spearman ρ with log LR. Plots and tables: `plots/dynlr/` (`lr_summary.md`). W&B: personal
+`llama3.2-arch-small-scoring-model`.
+
+Final eval loss (bold: 6B optimum; † = 1B-tuned baseline):
+
+| NorMuon | 0.00125 | 0.0025 | 0.005 | 0.01† | 0.02 | 0.03 |
+|---|---|---|---|---|---|---|
+| | 3.048 | 3.000 | 2.983 | **2.982** | 2.999 | 3.013 |
+
+| Muon | 0.00125 | 0.0025 | 0.005 | 0.01† | 0.02 | 0.03 |
+|---|---|---|---|---|---|---|
+| | 3.051 | 3.005 | 2.985 | **2.983** | 3.002 | 3.014 |
+
+| AdamW | 2.5e-4 | 5e-4 | 1e-3† | 2e-3 | 3e-3 | 4e-3 |
+|---|---|---|---|---|---|---|
+| | 3.124 | 3.050 | 3.014 | **3.007** | 3.012 | 3.025 |
+
+| SOAP | 2.5e-4 | 5e-4 | 1e-3 | 2e-3 | 4e-3† | 8e-3 | 1.2e-2 |
+|---|---|---|---|---|---|---|---|
+| | 3.065 | 3.010 | 2.981 | **2.978** | 2.985 | 3.009 | 3.033 |
+
+| Sophia | 5e-5 | 1e-4 | 2e-4† | 3e-4 | 4e-4 | 4.5e-4 |
+|---|---|---|---|---|---|---|
+| | 3.162 | 3.069 | 3.052 | **3.045** | 3.058 | 3.064 |
+
+No run diverged (no train-loss spikes after warmup); seed noise at 6b is ~0.003, so NorMuon / Muon 0.005 vs 0.01 and
+SOAP 1e-3 vs 2e-3 are ties.
+
+- **The 1B-token LRs are not all optimal at 6B.** AdamW wants 2x (−0.007), Sophia 1.5x (−0.007), SOAP 0.5x (−0.007);
+  Muon / NorMuon stay put.
+- **Loss vs log LR is a flat-bottomed bowl, ~2-4x wide within 0.007 of the best** (Muon-type 0.005-0.01, SOAP
+  1e-3-4e-3, AdamW 1e-3-3e-3). Penalty vs the 6B optimum at equal LR ratios (below / above):
+
+  | Optimizer | 2x (Sophia 1.5x) | 4x (Sophia 3x / 1.5x) | 8x (SOAP 6x above, Sophia 6x below) |
+  |---|---|---|---|
+  | NorMuon / Muon | +0.001-0.002 / +0.017-0.019 | +0.018-0.022 / +0.031 at 3x | +0.066-0.068 / – |
+  | AdamW | +0.007 / +0.018 | +0.043 / – (2x above is the edge) | +0.117 / – |
+  | SOAP | +0.003 / +0.007 | +0.032 / +0.031 | +0.087 / +0.055 |
+  | Sophia | +0.007 / +0.019 | +0.024 / – | +0.117 / – |
+
+  Near the optimum, going too high costs more than going too low by the same factor (Muon-type, AdamW, Sophia; SOAP is
+  symmetric). The large too-low losses of AdamW and Sophia in the 1B-tuned grid came from that grid sitting below
+  their 6B optimum, not from a steeper low side.
+- **Metrics that only measure the LR** (stable ρ = ±1 for every optimizer, except SOAP's gradient norm −0.96):
+  update RMS, ‖W‖, σ₁(W) and the 50-step change rise with LR; the gradient norm falls. No turning point at the optimum.
+- **Directional sharpness splits the optimizers.** AdamW, SOAP, Sophia: it falls steeply with LR (stable median AdamW
+  0.135 → 0.0012 over 16x LR, ∝ LR^−1.7; SOAP 0.079 → 0.0002 over 48x, ∝ LR^−1.5; Sophia ∝ LR^−1.9): a higher LR keeps
+  the run in flatter regions (edge of stability). **Muon / NorMuon: an inverted U that peaks at the optimum** (0.0026
+  / 0.0031 / 0.0036 / **0.0038** / 0.0027 / 0.0018 from 0.00125 to 0.03, both variants).
+- **Oscillation (consecutive-gradient cosine)** has no common optimal value: Muon-type −0.43 → −0.74, −0.54 to −0.65 at
+  the optimum; AdamW ≈ 0 up to its optimum, negative past it (−0.05 at 2e-3, −0.12 / −0.15 at 3e-3 / 4e-3); SOAP
+  positive and falling (+0.31 → +0.01), +0.27 at its optimum; Sophia flat (+0.34-0.38). In the early window Muon-type
+  is −0.71 to −0.76 at every LR: no early signal.
+- **Each optimizer has a non-monotone metric that peaks at its optimum, but a different one each** (one seed; the
+  peaks are shallow, so leads only):
+
+  | Optimizer | Metric peaking at the optimum (stable median, low → high LR) |
+  |---|---|
+  | Muon / NorMuon | directional sharpness (above); ‖dW‖/‖W‖ has its minimum at 0.005 (0.0056 / 0.0055 / **0.0054** / 0.0057 / 0.0070 / 0.0085): with weight decay a lower LR also shrinks ‖W‖, so the relative step stays the same below the optimum |
+  | AdamW | update effective rank 0.33 / 0.40 / 0.45 / **0.46** / 0.46 / 0.45, and of the 50-step change 0.48 / 0.53 / 0.56 / **0.57** / 0.57 / 0.56 |
+  | SOAP | update-gradient alignment 0.058 / 0.062 / 0.068 / **0.073** / 0.068 / 0.053 / 0.042 |
+  | Sophia | erank of the 50-step change 0.44 / 0.49 / 0.51 / **0.53** / 0.51 / 0.52; final win rate 0.58 / 0.45 / 0.28 / **0.20** / 0.16 / 0.14 (best ends at 0.20, below the 0.28-0.35 found at 2B, 2026-10-17) |
+
+  Muon-type update-gradient alignment rises (0.027 → 0.13) and saturates from 2x on: also a "just past the optimum"
+  marker.
+- Conclusion: most dynamics metrics report the LR itself. None is a universal "LR is right" signal across the five
+  optimizers; each has its own shallow peak at the optimum. Worth a second seed at the optimum and its neighbours
+  before using any of them for tuning.
+
+**Follow-up: geometric vs arithmetic LR series** (6 more runs, jobs 672729-672738: NorMuon / Muon 0.04, AdamW 1.41e-3 /
+2.83e-3, Sophia 2.45e-4 / 3.67e-4; final eval 3.029 / 3.031, 3.010 / 3.010, 3.044 / 3.058; none diverged).
+`analyze_lr_dynamics.py --series NAME:OPT=lr,...` indexes each series -2..+2 around the 6B optimum and reports
+asym i = |Δ(+i)| / |Δ(−i)| (log v for constant-ratio series, so a power law in LR gives 1). Tables and plots:
+`plots/dynlr/series_{geometric,arithmetic}.{md,png}`. Geometric: ratio 2 for NorMuon / Muon / SOAP, √2 for AdamW
+(4x = 8e-3 would diverge), √1.5 for Sophia (cliff near 5e-4). Arithmetic from existing runs only, so partial:
+NorMuon / Muon 0.01-0.04 (Δ 0.01, high side only), AdamW 1e-3-4e-3, Sophia 1e-4-4e-4.
+
+- **Loss, geometric, ±2 steps**: the high side costs 2.2-2.7x the low side for NorMuon (+0.047 vs +0.018), Muon
+  (+0.048 / +0.022), AdamW (+0.018 / +0.007) and Sophia (+0.019 / +0.007); SOAP is symmetric (+0.031 / +0.032). At ±1
+  the low side is within seed noise (≤ 0.003) for all, so asym 1 is not measurable. Sophia 2.45e-4 (3.044) ties 3e-4.
+- **For AdamW, SOAP and Sophia the magnitude metrics are power laws in LR**: asym on log v is 0.9-1.2 for upd_rel,
+  upd_rms, w_norm, w_sigma1 and dir_sharpness (AdamW sharpness ∝ LR^-1.6, symmetric). The large Δ% asymmetries in
+  the earlier tables were the % scale on a power law. A given log-change in these metrics costs ~2.5x more loss on
+  the high side.
+- **Muon-type is not a power law around its optimum**: dir_sharpness asym 5.2-5.6 (flat below, falling above),
+  upd_rel 3.5 / 20, upd_rms 2.8 / 6.2, upd_erank_frac up to 8: these change only above the optimum, i.e. they mark
+  "too high", not "too low". delta_rel and upd_spec_rel are power laws (asym 1.0-1.1) and carry no position.
+- **Arithmetic high side (Δ 0.01) of NorMuon / Muon**: loss rises linearly in LR (+0.017 / +0.031 / +0.047, ≈ +0.016
+  per +0.01), and so does upd_rel (+23 / +50 / +78%); sharpness saturates (−29 / −52 / −67%). Completing the
+  arithmetic grids needs 8-10 runs near the optimum, where differences are seed-noise sized (2 seeds).
+
+## 2026-11-03 — Optimizer dynamics vs a geometric LR series on the 1B model (5 optimizers, 1B tokens)
+
+**Why.** Does the proxy's LR-vs-dynamics picture (2026-11-01) hold on the main model? Setup: train.py defaults (doc
+packing, `--batch_ramp 32:0.5,64`, WSD 2% / 10% linear, wd 0.1, 2,860 steps), 1B tokens, `--dyn_every 50`, default
+seed, W&B personal `llama3.2-1b-optim-dynamics`. Only the peak LR changes (Muon-type: matrix LR; AdamW part 3e-3).
+5 LRs per optimizer as a geometric series around the best LR. Runs `main-dynlr-<opt>-<lr>-1b`, jobs 675846-684553;
+centres reused: `normuon-default-1b-dyn` (570076), `soap3e-3-normwd-1b-dyn` (570077). Account cap: 5 runs at a time
+(`MaxGRESPerAccount`), ~10 h wall. Tables: `plots/dynlr_main/series_geometric.md` (stable window 300-2520).
+Single-run spread of the final eval on this model at 1B tokens: ~0.013.
+
+| Optimizer (ratio) | −2 | −1 | centre | +1 | +2 |
+|---|---|---|---|---|---|
+| NorMuon (√2) | 0.005: 2.956 | 0.00707: 2.941 | **0.01: 2.932** | 0.0141: 2.931 | 0.02: 2.943 |
+| Muon (√2) | 0.005: 2.966 | 0.00707: 2.960 | **0.01: 2.938** | 0.0141: 2.945 | 0.02: 2.962 |
+| SOAP (2) | 7.5e-4: 2.993 | 1.5e-3: 2.958 | **3e-3: 2.955** | 6e-3: 3.014 | 1.2e-2: 3.486 |
+| AdamW (√2) | 3.54e-4: 3.155 | 5e-4: 3.128 | **7.07e-4: 3.101** | 1e-3: 3.151 | 1.41e-3: 3.307 (spike to 6.5 at step 2,100) |
+| Sophia (√2, ρ 0.05, wd 0.2) | 3.54e-5: 3.319 | 5e-5: 3.264 | **7.07e-5: 3.249** | 1e-4: 3.309 | 1.41e-4: 3.424 |
+
+- Re-centred during the run: AdamW was planned at 1e-3 (proxy transfer) and Sophia at 1e-4. Extra runs: AdamW 2e-3
+  (loss stalled at 4.8-4.9 from step ~1,000, spike to 6.8 at 2,150, final 4.579; excluded), 2.5e-4 (3.227).
+  Cancelled before start: AdamW 4e-3, 1.41e-3 (first submission), Sophia 2e-4.
+- **LR transfer from the proxy**: Muon-type and SOAP transfer 1:1 (0.01, 3e-3); AdamW does not (main 7e-4 vs proxy
+  1B-token 1e-3, and the main model breaks at ≥ 1.41e-3 where the proxy was stable at 4e-3); Sophia's main optimum
+  (7e-5) is 3x below the proxy's 1B-tuned 2e-4.
+- **Metrics extremal at the centre** (Δ at −1 / +1, −2 / +2): NorMuon upd_erank_frac (−0.5 / −0.1%, −0.9 / −0.7%);
+  Muon upd_grad_align (−12 / −3%, −32 / −8%); SOAP grad_cos_prev (−7 / −31%, −13 / −97%) and upd_srank (−17 / −10%);
+  AdamW upd_srank (−1.1 / −20%, −2.5 / −27%); Sophia upd_spec_rel (−4 / −4%, −12 / −10%) and upd_erank_frac.
+  **None of the proxy's centre-peaking metrics repeats**: Muon-type sharpness is monotone here (flat below, −21 / −46%
+  above), SOAP's upd_grad_align and AdamW's / Sophia's erank are monotone in LR. Still no universal signal.
+- **Power laws hold**: for SOAP, AdamW and Sophia upd_rel, upd_rms, w_norm and dir_sharpness are near-symmetric in
+  log LR (asym 0.7-1.2), as on the proxy. Muon-type sharpness / upd_rel still move more above the optimum (asym
+  1.6-4.5), less one-sided than the proxy (up to 20).
+- **Loss asymmetry**: with √2 steps the Muon-type loss is level or worse on the low side (NorMuon +0.024 / +0.011);
+  AdamW (+0.054 / +0.206), Sophia (+0.070 / +0.175) and SOAP (+0.038 / +0.531) are worse on the high side, where
+  AdamW and SOAP approach instability (SOAP 1.2e-2: grad_norm +426%, sharpness rising again).
+
+## 2026-11-03 — Probe-batch sharpness (`--dyn_probe`): Muon / NorMuon LR sweep on the proxy rerun (6B tokens)
+
+**Why.** `dir_sharpness` = (g_b − g_a)·v_a / |v_a|² takes g_a and g_b from two training batches. Is its inverted U
+over the Muon LR (peak at the optimum, 2026-11-01) real or batch noise? New: `--dyn_probe` (`ProbeSharpness` /
+`ProbeCallback` in `llama_train/optim_dynamics.py`, `tests/test_probe_sharpness.py`): every `--dyn_every` steps the
+gradient of a FIXED probe batch (val.bin, 1 x 32 blocks per GPU = 256 blocks, never trained on) before and after one
+optimizer step -> `probe_sharpness` = Δg_P·v / |v|², `probe_D1`, `probe_slope`, `probe_loss`, `probe_dloss`. Training
+untouched (autograd.grad). Rerun: `proxy-dynlr-{normuon,muon}-<lr>-6b-probe`, LR 0.00125-0.04, same flags / seed as
+2026-11-01 + `--dyn_probe`, jobs 685786-686166, W&B personal. Tables: `plots/dynlr_probe/`.
+
+Final eval reproduces the first sweep within noise (NorMuon 0.005 / 0.01: 2.981 / 2.986 vs 2.983 / 2.982).
+
+| Stable median (500-10250) | 0.00125 | 0.0025 | 0.005 | 0.01 | 0.02 | 0.03 | 0.04 |
+|---|---|---|---|---|---|---|---|
+| NorMuon dir_sharpness | 0.00259 | 0.00309 | 0.00361 | **0.00377** | 0.00282 | 0.00181 | 0.00128 |
+| NorMuon probe_sharpness | 0.00043 | 0.00057 | 0.00084 | **0.00111** | 0.00108 | 0.00073 | 0.00056 |
+| Muon dir_sharpness | 0.00257 | 0.00309 | 0.00363 | **0.00379** | 0.00271 | 0.00183 | 0.00128 |
+| Muon probe_sharpness | 0.00042 | 0.00056 | 0.00087 | **0.00112** | 0.00097 | 0.00075 | 0.00056 |
+| dir / probe (NorMuon) | 6.0 | 5.4 | 4.3 | 3.4 | 2.6 | 2.5 | 2.3 |
+| embedding share of \|v\|² | 0.995 | 0.980 | 0.924 | 0.746 | 0.410 | 0.228 | 0.138 |
+
+- **The inverted U survives without batch noise** and still peaks at 0.01 (NorMuon flat 0.01-0.02). The probe curve
+  is more symmetric: at 0.25x / 4x the best LR −49 / −50% (dir_sharpness −18 / −66%).
+- **dir_sharpness is 2.3-6x too large, never negative, smoother step to step** (relative jitter 3-5% vs the probe's
+  9-13%): a positive bias, not zero-mean noise, larger at low LR. The update is built from g_a, so −ε_a·v_a > 0. The
+  bias flattened the low-LR side. In the decay it reverses the trend: dir_sharpness rises (ratio up to 19), the probe
+  falls (NorMuon 0.00125: 0.00043 stable → 0.00027 decay).
+- **The global peak is a mixture effect, not a per-block optimum.** Per block type, probe sharpness of every Muon
+  matrix falls monotonically with the LR (attn_q 0.027 → 0.00036 over 32x, ∝ LR^-1.25; attn_v 0.38 → 0.0038), the
+  norms' rises (0.066 → 0.44), the embedding's is ~6e-5-1.2e-4. The embedding (AdamW 3e-3, fixed while the Muon LR
+  varies) holds 99.5% of |v|² at 0.00125 and 14% at 0.04, so the global value moves from the flat embedding to the
+  matrices; the peak sits where their update sizes cross (embedding share 0.75 → 0.41 between 0.01 and 0.02). That it
+  coincides with the loss optimum depends on the embedding LR (3e-3) and the model's shapes, which plausibly explains
+  why it did not repeat on the 1B model (2026-11-03).
+
+## 2026-11-07 — Probe sharpness on the 1B model: NorMuon / Muon LR 0.0025-0.04 (x2), 1B tokens
+
+Setup as 2026-11-03 (train.py defaults, 1B tokens, `--dyn_every 50`) + `--dyn_probe --dyn_probe_micro=4` (probe =
+64 val blocks x 8192 = 524k tokens, the proxy's probe size). Runs `main-dynlr-{normuon,muon}-<lr>-1b-probe`, jobs
+718861-718881, W&B personal `llama3.2-1b-optim-dynamics`. Tables: `plots/dynlr_main_probe/` (stable 300-2520).
+
+| | 0.0025 | 0.005 | 0.01 | 0.02 | 0.04 |
+|---|---|---|---|---|---|
+| NorMuon final eval | 3.040 | 2.961 | 2.949 | **2.944** | 3.064 |
+| NorMuon dir_sharpness | 0.00243 | **0.00276** | 0.00243 | 0.00130 | 0.00070 |
+| NorMuon probe_sharpness | 0.000150 | 0.000178 | **0.000210** | 0.000165 | 0.000131 |
+| Muon final eval | 3.029 | 2.962 | **2.942** | 2.964 | 3.112 |
+| Muon dir_sharpness | 0.00245 | **0.00274** | 0.00237 | 0.00130 | 0.00077 |
+| Muon probe_sharpness | 0.000160 | 0.000203 | **0.000211** | 0.000194 | 0.000136 |
+| dir / probe (NorMuon) | 16.1 | 15.6 | 11.6 | 7.9 | 5.4 |
+| embedding share of \|v\|² | 0.962 | 0.864 | 0.607 | 0.265 | 0.076 |
+
+- With x2 steps the loss V is clear (NorMuon +0.091 / +0.115, Muon +0.087 / +0.170 at 0.25x / 4x). NorMuon 0.01
+  ended 2.949 here vs 2.932 in 2026-11-03 (same flags): the ~0.013-0.017 single-run spread.
+- **Probe sharpness peaks at the optimum on the 1B model too** (NorMuon −28 / −15 / −21 / −38%, Muon −24 / −4 / −8 /
+  −35% at 0.25x / 0.5x / 2x / 4x). The proxy's finding holds once the noise bias is removed; the 2026-11-03 "no peak"
+  was the measurement.
+- **dir_sharpness is 5-16x the probe value here** (proxy 2.3-6x), and its peak sits one step low (0.005). The bias
+  is larger on this model; the training batch in the first half is 262k tokens vs the proxy's 524k.
+- Same mechanism as the proxy: every matrix block's probe sharpness falls monotonically with the LR (attn_q 0.0019 →
+  0.00003), the norms' and the embedding's rise; the embedding (AdamW 3e-3, fixed) goes from 96% to 8% of |v|², and
+  the global peak sits where the embedding share is ~0.6 (proxy: between 0.75 and 0.41). It matches the loss optimum
+  on both models, but through the fixed embedding LR, so not as a general optimality signal.

@@ -86,6 +86,30 @@ def grad_noise_callbacks(args, plan, model, train_ds, collate, save_dir, seed):
                               extra_fn=lambda step: {"global/gns_batch": plan.batch_at(step) * plan.block_size})]
 
 
+def probe_callbacks(args, plan, model, val_ds, collate, save_dir):
+    """--dyn_probe: ProbeCallback on every rank. Rank r's probe micro-batches are val.bin blocks
+    [(r * n + j) * m, (r * n + j + 1) * m) for j < n = --dyn_probe_micro, m = --per_device_batch (a compiled training
+    shape): never trained on, disjoint across ranks, the same at every measurement."""
+    if not (args.dyn_every and args.dyn_probe):
+        return []
+    from llama_train.optim_dynamics import ProbeCallback, make_wandb_log_fn
+    rank, world, n, m = int(os.environ.get("RANK", 0)), plan.world_size, args.dyn_probe_micro, plan.per_device_batch
+    assert world * n * m <= len(val_ds), "val.bin has too few blocks for --dyn_probe"
+
+    def loss_fn(j):
+        start = (rank * n + j) * m
+        feats = [val_ds[i] for i in range(start, start + m)]
+        batch = collate(feats) if collate else {k: torch.stack([f[k] for f in feats]) for k in feats[0]}
+        batch = {k: v.cuda(non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return model(**batch).loss
+
+    out = os.path.expanduser(args.dyn_out or os.path.join(save_dir, "optim_dynamics.jsonl"))  # shared with the dyn logger
+    print(f"Probe sharpness every {args.dyn_every} steps on {world * n * m} val blocks ({n} x {m} per GPU) -> {out}")
+    return [ProbeCallback(loss_fn, args.dyn_every, n, out_path=out,
+                          log_fn=make_wandb_log_fn(per_layer="none") if rank == 0 else None)]
+
+
 def main(argv=None):
     start_time = time.time()
     print(torch.__version__, "Cuda:", torch.cuda.is_available(), torch.version.cuda)  # GPU check
@@ -172,7 +196,8 @@ def main(argv=None):
         + ([RampLRCallback(plan, args.ramp_lr_mult)] if args.ramp_lr_mult != 1.0 else [])
         + ([ProfilerCallback(args.profile_dir, args.profile_start, args.profile_cpu)] if args.profile_dir else [])
         + optim_dynamics_callbacks(args, save_dir)
-        + grad_noise_callbacks(args, plan, model, train_ds, collate, save_dir, training_args.seed),
+        + grad_noise_callbacks(args, plan, model, train_ds, collate, save_dir, training_args.seed)
+        + probe_callbacks(args, plan, model, val_ds, collate, save_dir),
         optimizers=(optimizer, None),  # None -> Trainer builds AdamW from args; scheduler always from args
         cli_args=args, plan=plan, lr_lambda=lr_lambda, dev_dataset=dev_ds, step_timer=step_timer, extra_logs=sophia_stats,
         keep_step_batches=sophia_cb is not None,
